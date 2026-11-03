@@ -1325,6 +1325,28 @@ def find_capture_keep_btn():
     return ((xa + mid_x) // 2, (yt + yb) // 2)
 
 
+# ---- 鱼护满了怎么办 ----
+#   "stop"（默认）：只停手，**不关游戏**。醒来还能直接接着钓，人来了自己卖鱼/换护。
+#   "quit"        ：上游行为，走控制面板把游戏关掉。
+KEEPNET_FULL_ACTION = "stop"
+
+
+def on_keepnet_full(player) -> None:
+    """鱼护满时的收尾。默认只停手，不动游戏。"""
+    if KEEPNET_FULL_ACTION == "quit":
+        player.general_quit("Keepnet is full")
+        return
+    release_lift()
+    print("", flush=True)
+    print("=" * 56, flush=True)
+    print("  鱼护已满，脚本停手（游戏保持不动，不会退出）", flush=True)
+    print("  去卖鱼 / 换鱼护之后，再双击一次桌面开关就能继续。", flush=True)
+    print("=" * 56, flush=True)
+    # 用 KeyboardInterrupt 打断主循环：main() 里会接住它，
+    # 走 finally 还原窗口、bot_ctl 再释放按键。比 general_quit 温和得多。
+    raise KeyboardInterrupt
+
+
 # ---- 通用弹窗「确定」按钮：(871..1048, 793..826)，实测多个弹窗共用这个位置 ----
 OK_BTN_BOX = (871, 793, 1048, 826)
 OK_BTN_CENTER = (960, 810)
@@ -1417,8 +1439,8 @@ def patch_handle_fish_click():
                 self.timer.update_cast_time()
             self.timer.add_cast_time()
             limit = self.cfg.BOT.KEEPNET.CAPACITY - self.cfg.ARGS.FISHES_IN_KEEPNET
-            if self.result.kept == limit:
-                self.general_quit("Keepnet is full")
+            if self.result.kept >= limit:
+                on_keepnet_full(self)
 
     def _handle_fish(self) -> None:
         self.result.total += 1
