@@ -1,0 +1,25 @@
+# 第三方 RF4S 源码（需自行 clone，不入库）
+refs/
+
+# 抓包、日志、截图等运行产物
+captures/
+*.pcapng
+*.pcap
+*.log
+*.png
+*.jpg
+_stuck/
+run.pid
+_run_bot.cmd
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# 本地配置 / 账号相关
+.token
+*.token
+config.local.*
