@@ -516,17 +516,17 @@ def _wheel_raw(n: int) -> None:
 
 
 def friction_absolute(target: int = FRICTION_INITIAL) -> None:
-    """绝对校准：先滚到顶，再退回 target。
+    """绝对校准：先滚到顶（30），再退回 target。
 
-    **只做一次**（_fric["calibrated"] 标记）：之后每次抛竿都**保留当前档位**。
-    之前每次抛竿都重置回 17，搏鱼中升上去的档位一下就清零了，
-    档位永远停在起点 —— 2026-11-04 玩家指出后改。
+    **每次抛竿前都做**（玩家 2026-11-04 04:17 明确要求，理由也是对的）：
+
+      * 抛竿时线上没有鱼，**顶着满档也是安全的**；等鱼上钩之后再校准才危险
+        （鱼已经在拉，一滚到 30 就可能直接断线）
+      * 绝对校准不依赖"档位记忆"，错一次不会一直错下去 —— 相对调整则会累积误差
+      * 每条鱼的起点都确定是 17，搏鱼中的调整可以放心做，下一条鱼自动归位
+
+    代价是每竿多约 2.4 秒（43 格滚轮 × 55ms），可以接受。
     """
-    # calibrated 是**本进程**标记，不从盘上恢复：盘上的旧状态可能对应着
-    # 手动动过滚轮 / 游戏重登，不可信。每个会话启动都重新绝对校准一次。
-    # （盘上状态的用途是给接管工具**读**，主脚本只往里写。）
-    if _fric.get("calibrated"):
-        return
     if not focus_game_quiet():
         print("[patch][warn] 摩擦片绝对校准跳过：游戏窗口没能置前", flush=True)
         return
@@ -537,7 +537,7 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
     _fric["t"] = time.time()
     _fric["calibrated"] = True
     friction_state.set(target, calibrated=True)
-    print(f"[patch] 摩擦片绝对校准 -> {target} 档（仅此一次，已落盘）", flush=True)
+    print(f"[patch] 摩擦片绝对校准 -> {target} 档（抛竿前，线上无鱼，安全）", flush=True)
 
 
 def _reset_friction_for_fish() -> None:
@@ -681,7 +681,7 @@ def patch_cast(pdi):
         release_lift()                     # 抛竿前把抬竿松开
         time.sleep(0.15)
         maybe_dismiss("抛竿前")            # 卡牌/技能/升级弹窗会吃掉 Shift+F5
-        friction_absolute(FRICTION_INITIAL)   # 唯一一次绝对校准
+        friction_absolute(FRICTION_INITIAL)   # 每竿前都校准（线上无鱼，安全）
         self.stage = StageId.CAST
         focus_game_quiet()
 
@@ -853,6 +853,7 @@ def patch_tackle_ready_timeout(seconds=TACKLE_READY_TIMEOUT):
 
 
 PULL_TIMEOUT = 120.0
+PULL_IDLE_SECS = 15.0   # 力度条连续无色多久才算搏鱼结束（原来实际只有 2 秒）
 RETRIEVAL_FINISH_STREAK = 6   # 连续匹配次数才认定"收线完成"
 
 # ====================== 抬竿（右键 -> F6，全程按住）=======================
@@ -982,12 +983,13 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
         if self.stage != StageId.PULL:
             self.stage = StageId.PULL
             self.timer.set_timeout_start_time()
-        # 每条鱼都从 17 档起步（玩家 2026-11-04 指定：档位调整是**单条鱼**范围内的
-        # 行为 —— 搏鱼中遇红调小、一直绿调大；下一条鱼恢复 17）。
+        # 兜底：正常情况下"抛竿前绝对校准"已经把档位设回 17 了，
+        # 这里只处理"没抛竿就有鱼"的边角情况。cur 已是 17 时这是个空操作，
+        # 不会再出现"鱼上钩后才去大幅调档"的危险动作。
         _reset_friction_for_fish()
         hold_lift()      # 抬竿全程按住（左键由外层 hold_keys 一直按着）
         start = time.time()
-        idle = 0
+        idle_since = None      # 力度条开始持续无色的时刻（None=当前有张力）
         win = []         # [(t, 力度等级)]，只留最近 10 秒，给摩擦片控制器用
         ring_high_since = None
         low_streak = 0
@@ -1055,13 +1057,20 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
                           flush=True)
                     last_ring_log = time.time()
 
+                # 力度条无色 = 这一瞬间鱼没在拉（可能是停顿，也可能已经到岸边）。
+                # ⚠️ 这里原来写的是 `idle >= 10` 个样本，注释还写着"约 5 秒"，
+                # 但实际采样间隔 0.2s，**10 个样本只有 2 秒** —— 鱼只要歇两秒就被
+                # 判成"搏鱼结束"，于是松开左右键、转进抬竿阶段再重新按住，
+                # 玩家看到的就是"钓着钓着键松一下又按回来"（2026-11-04 04:18 反馈）。
+                # 改成按真实秒数计时，阈值给到 15 秒：正常鱼停顿不会这么久。
                 if lvl > 0:
-                    idle = 0
+                    idle_since = None
                 else:
-                    idle += 1
-                    if idle >= 10:      # 约 5 秒
-                        print("[patch] 力度条持续无色，结束搏鱼（转抬竿上鱼）",
-                              flush=True)
+                    if idle_since is None:
+                        idle_since = time.time()
+                    elif time.time() - idle_since >= PULL_IDLE_SECS:
+                        print(f"[patch] 力度条持续无色 {PULL_IDLE_SECS:.0f}s，"
+                              f"结束搏鱼（转抬竿上鱼）", flush=True)
                         return
 
                 if time.time() - start > timeout:
