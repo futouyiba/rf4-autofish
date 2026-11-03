@@ -449,12 +449,15 @@ FRICTION_MIN = 1
 FRICTION_ABS_TOP = 30          # 绝对校准时的"顶"（上游 MAX_FRICTION_BRAKE=30）
 FRICTION_DROP_DIV = 3          # 红 -> 降 1/3：17 - 17//3 = 12，16 - 16//3 = 11
 FRICTION_RISE_DIV = 5          # 10 秒全绿 -> 升 1/5：17 + 17//5 = 20（向上滚 3 格）
-FRICTION_WINDOW = 10.0
+FRICTION_WINDOW = 10.0   # 红判据的观察窗口
+FRICTION_MIN_EVAL = 3.0   # 至少攒这么多秒的样本才做判断（10s 窗口对短搏鱼太长）
+FRICTION_RISE_WINDOW = 6.0   # 升档判据的窗口（原来的 10 秒太长，搏鱼往往不到 10 秒）
+FRICTION_RISE_MIN_GREEN = 3  # 窗口内至少这么多次"绿"才认为真的轻松
 FRICTION_SAMPLE = 0.2
 FRICTION_SCROLL_GAP = 0.055    # 每格之间的间隔
 FRICTION_LOCK = 0.8            # 调整后锁这么久，避免连续触发
 
-_fric = {"cur": FRICTION_INITIAL, "t": 0.0}
+_fric = {"cur": FRICTION_INITIAL, "t": 0.0, "calibrated": False}
 
 
 def _drop_target(cur: int) -> int:
@@ -468,79 +471,110 @@ def _rise_target(cur: int) -> int:
 
 
 def _wheel(n: int) -> None:
-    """滚轮 n 格：正=向上（加档），负=向下。"""
+    """滚轮 n 格（正=加档，负=减档），**并立刻把这个变化记进 _fric["cur"]**。
+
+    这里必须自己是唯一入口：只要有一次"滚了但没记账"，后面所有的判断都建立在错的
+    档位上，最后就是断线。所以谁调档都只能通过这个函数（或它上面包一层的
+    friction_nudge / friction_absolute），不要直接发滚轮事件。
+
+    玩家确认（2026-11-04）：这套滚轮方式一直是有效的（抛竿前"滚满 30 再退回 17"
+    那套绝对校准就是用它做的），所以保持原样。
+    """
+    _wheel_raw(n)
+    _fric["cur"] = max(FRICTION_MIN, min(FRICTION_MAX, _fric["cur"] + n))
+    _fric["t"] = time.time()
+    print(f"[patch] 摩擦片 -> {_fric['cur']} 档（{n:+d}）", flush=True)
+
+
+def _wheel_raw(n: int) -> None:
+    """只发滚轮事件，不记账（绝对校准内部用：它的档位由调用方设定）。"""
     if n == 0:
         return
-    u = ctypes.windll.user32
+    if not focus_game_quiet():
+        print("[patch][warn] 滚轮跳过：游戏窗口没能置前", flush=True)
+        return
     delta = 120 if n > 0 else -120
     for _ in range(abs(n)):
-        u.mouse_event(0x0800, 0, 0, delta, 0)   # MOUSEEVENTF_WHEEL
+        ctypes.windll.user32.mouse_event(0x0800, 0, 0, delta, 0)   # MOUSEEVENTF_WHEEL
         time.sleep(FRICTION_SCROLL_GAP)
 
 
 def friction_absolute(target: int = FRICTION_INITIAL) -> None:
-    """抛竿前的绝对校准：先滚到顶，再退回 target。**只在抛竿前用。**"""
+    """绝对校准：先滚到顶，再退回 target。
+
+    **只做一次**（_fric["calibrated"] 标记）：之后每次抛竿都**保留当前档位**。
+    之前每次抛竿都重置回 17，搏鱼中升上去的档位一下就清零了，
+    档位永远停在起点 —— 2026-11-04 玩家指出后改。
+    """
+    if _fric.get("calibrated"):
+        print(f"[patch] 摩擦片保留 {target if False else _fric['cur']} 档（已校准过，不重置）",
+              flush=True)
+        return
     if not focus_game_quiet():
         print("[patch][warn] 摩擦片绝对校准跳过：游戏窗口没能置前", flush=True)
         return
-    _wheel(FRICTION_ABS_TOP)
+    _wheel_raw(FRICTION_ABS_TOP)
     time.sleep(0.2)
-    _wheel(-(FRICTION_ABS_TOP - target))
+    _wheel_raw(-(FRICTION_ABS_TOP - target))
     _fric["cur"] = target
     _fric["t"] = time.time()
-    print(f"[patch] 摩擦片绝对校准 -> {target} 档", flush=True)
+    _fric["calibrated"] = True
+    print(f"[patch] 摩擦片绝对校准 -> {target} 档（仅此一次）", flush=True)
 
 
 def friction_nudge(delta: int) -> None:
-    """增量调整：只滚 |delta| 格，并同步脚本内的状态变量。
-
-    置前失败就**什么都不做、也不改状态**——宁可这轮不调，也不要把状态变量改成一个
-    游戏里实际不成立的值（那会让后面所有判断都错，最后就是断线）。
-    """
+    """增量调整：只滚需要的那几格，档位由 _wheel 统一记账。"""
     if delta == 0:
         return
-    new = max(FRICTION_MIN, min(FRICTION_MAX, _fric["cur"] + delta))
-    if new == _fric["cur"]:
-        return
-    if not focus_game_quiet():
-        print("[patch][warn] 摩擦片调整跳过：游戏窗口没能置前", flush=True)
-        return
-    _wheel(new - _fric["cur"])
-    print(f"[patch] 摩擦片 {_fric['cur']} -> {new}（{new - _fric['cur']:+d} 格）",
-          flush=True)
-    _fric["cur"] = new
-    _fric["t"] = time.time()
+    target = max(FRICTION_MIN, min(FRICTION_MAX, _fric["cur"] + delta))
+    _wheel(target - _fric["cur"])
 
 
 def friction_controller_step(win: list) -> None:
-    """搏鱼中的摩擦片控制。`win` 是 [(t, level), ...]，只保留最近 10 秒。
+    """搏鱼中的摩擦片控制，目标：**最近 10 秒的 max 落在橙色区**。
 
-    规则（玩家指定）：
-      * 最近 10 秒**只要有一帧到红** -> 立刻降 1/3（整数除法：17 -> 12）
-      * 最近 10 秒**全是绿**（没有黄/橙/红） -> 升 1/5（17 -> 20，向上滚 3 格）
-      * 其余（只有黄/橙）-> 不动
+    玩家 2026-11-04 给的规则（修正了我之前的误解）：
+      * 力度条表示的是**钓具承担的力**，跟"剩余耐力"（那是鱼的耐力）没关系
+      * 条会往两边走：越过第一条刻度线变橙，越过第二条变红
+      * 目标是把 10 秒的 max 稳在橙色：**max 变绿就调大，变红就立刻调小**
+      * 一直绿就一直往上调，但不超过 29 档（档位在 _fric["cur"] 里记着，不会失控）
+
+    所以行为是：
+      max >= 4 红   -> 立刻降 1/3（要有 2/3 帧确认，防背景透色假红）
+      max <= 2 黄绿 -> 升 1/5（每次评估窗口最多升一次）
+      max == 3 橙   -> 命中目标，不动
     """
     now = time.time()
     while win and now - win[0][0] > FRICTION_WINDOW:
         win.pop(0)
-    if not win or now - _fric["t"] < FRICTION_LOCK:
+    if not win:
+        return
+    if now - _fric["t"] < FRICTION_LOCK:      # 刚调过，给游戏一点反应时间
         return
 
     levels = [l for _, l in win]
     wmax = max(levels)
 
-    if wmax >= 4:                                   # 出现过红 -> 立刻降
-        # 只在"红确实持续"时动手：最近 3 帧里至少 2 帧是红（约 0.4s）。
-        # 单帧红常常是半透明条把背景（红色格纹袖子）透上来造成的假红。
+    if wmax >= 4:
+        # 红：立刻降。要求最近 3 帧里至少 2 帧红（背景透色常常只有单帧）。
         tail = [l for _, l in win[-3:]]
         if tail.count(4) < 2:
             return
         target = _drop_target(_fric["cur"])
+        print(f"[patch] 力度到红(max={wmax}) 降档 {_fric['cur']} -> {target}", flush=True)
         friction_nudge(target - _fric["cur"])
         win.clear()
-    elif wmax == 1 and now - win[0][0] >= FRICTION_WINDOW - 0.5:
-        # 整个窗口都只有绿 -> 升 1/5
+        return
+
+    # 绿/黄：负载还不够，往上加。等窗口攒够 MIN_EVAL 秒再判，避免刚咬钩就动手。
+    if now - win[0][0] < FRICTION_MIN_EVAL:
+        return
+    if wmax <= 2:
         target = _rise_target(_fric["cur"])
+        if target == _fric["cur"]:
+            return
+        print(f"[patch] 10s max={wmax}(未到橙) 升档 {_fric['cur']} -> {target} "
+              f"| 等级序列 {levels[-20:]}", flush=True)
         friction_nudge(target - _fric["cur"])
         win.clear()
 
@@ -875,7 +909,8 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
 
                 # 力度条等级：既用来判断"鱼还在不在"，也喂给摩擦片控制器
                 try:
-                    lvl = friction_level()
+                    lvl, bar_info = friction_bar_state()
+                    _log_bar_sample(lvl, bar_info)
                 except Exception:
                     lvl = 0
                 win.append((time.time(), lvl))
@@ -1252,10 +1287,10 @@ class _INPUT(ctypes.Structure):
     _fields_ = [("type", ctypes.c_ulong), ("u", _INPUTUNION)]
 
 
-def _send_mouse(flags: int, dx: int = 0, dy: int = 0) -> None:
+def _send_mouse(flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> None:
     inp = _INPUT()
     inp.type = 0                      # INPUT_MOUSE
-    inp.u.mi = _MOUSEINPUT(dx, dy, 0, flags, 0, 0)
+    inp.u.mi = _MOUSEINPUT(dx, dy, ctypes.c_ulong(data & 0xFFFFFFFF), flags, 0, 0)
     ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
 
 
@@ -1490,19 +1525,55 @@ def net_toggle() -> None:
 FRICTION_BAR = (1045, 1058, 550, 1400)   # y1, y2, x1, x2
 
 # 等级：0=无/说不清, 1=绿, 2=黄, 3=橙, 4=红
-FRICTION_SAT_MIN = 90      # HSV 饱和度下限
-FRICTION_COLOR_MIN = 0.05  # 某种颜色占比超过 5% 才算数
+FRICTION_SAT_MIN = 90      # 旧判据的饱和度下限（保留给文档/兼容）
+FRICTION_COLOR_MIN = 0.05  # 旧判据的颜色占比阈值（保留）
+
+# 新判据（按"彩色带前缘"识别）：实测带子是不透明画的，S 155~170、V≈200；
+# 而背景（红格纹袖子）透上来的颜色只有 S 60~85，用这个阈值就能把假红挡掉。
+BAR_SAT_MIN = 130          # 带子像素的饱和度下限
+BAR_VAL_MIN = 110          # 带子像素的亮度下限
+BAR_MIN_WIDTH = 12         # 带子至少这么宽才认（再窄就是噪声）
 # 注：摩擦片的档位常量统一在上面「摩擦片：维护状态变量」一节定义，
 # 这里不要再重复定义，否则后面的值会把前面的覆盖掉（踩过：RISE_RATIO 变成 1/6）。
 
 
-def friction_level() -> int:
-    """返回钓具力度条当前等级：0=无, 1=绿, 2=黄, 3=橙, 4=红。
+_bar_info = {"level": 0, "span": None, "hue": None, "sat": None}
+_fric_log = {"fh": None, "t0": None}
 
-    取条上占比最大的那种颜色。条是半透明叠在背景上的，
-    所以用 HSV 的**色相 + 饱和度**分类，而不是比对固定 RGB。
 
-    必须定义在模块级：Windows 用 spawn，子进程靠 pickle 引用。
+def _log_bar_sample(level, info):
+    """把每次力度条读数写进 bot/_fric_log.csv，供事后标定阈值用。"""
+    try:
+        if _fric_log["fh"] is None:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "_fric_log.csv")
+            _fric_log["fh"] = open(path, "w", encoding="utf-8")
+            _fric_log["fh"].write("t,level,span0,span1,hue,sat,friction\n")
+            _fric_log["t0"] = time.time()
+        span = info.get("span") or ("", "")
+        t = time.time() - _fric_log["t0"]
+        _fric_log["fh"].write(
+            f"{t:.2f},{level},{span[0]},{span[1]},{info.get('hue','')},"
+            f"{info.get('sat','')},{_fric['cur']}\n")
+        _fric_log["fh"].flush()
+    except Exception:
+        pass
+
+
+
+def friction_bar_state():
+    """解析底部力度条，返回 (level, info)。
+
+    实测这个条的结构（2026-11-04 在真实搏鱼画面上一列一列量出来的）：
+
+      * 轨道 x≈540..1390，y≈1047..1058，平时是灰的（S≈40）
+      * **有负载时出现一段彩色带**，而且不是"从左往右填"，是**一段浮动的渐变带**：
+        左端绿、右端黄/橙/红 —— **右端（前缘）的颜色才代表当前负载**
+      * 带子是**不透明**画的（S≈155~170, V≈200），背景透上来的颜色要暗得多
+        （实测红格纹袖子透上来只有 S≈60~85）—— 这就是之前"假红"的来源
+
+    所以判据改成：先用高饱和阈值找出带子 -> 取最右 25% 的中位色相当等级。
+    这样背景透色被阈值挡掉，也不会被"整条里红色占比"带的到处乱跑。
     """
     import cv2
 
@@ -1510,25 +1581,72 @@ def friction_level() -> int:
     a = np.asarray(img)
     y1, y2, x1, x2 = FRICTION_BAR
     if a.shape[0] < y2 or a.shape[1] < x2:
-        return 0
+        return 0, dict(_bar_info)
+
     strip = a[y1:y2, x1:x2]
     hsv = cv2.cvtColor(strip, cv2.COLOR_RGB2HSV)
     hh = hsv[:, :, 0].astype(int)
     ss = hsv[:, :, 1].astype(int)
     vv = hsv[:, :, 2].astype(int)
-    sat = (ss > FRICTION_SAT_MIN) & (vv > 80)
 
-    shares = {
-        4: (((hh <= 10) | (hh >= 170)) & sat).mean(),   # 红
-        3: (((hh >= 11) & (hh <= 22)) & sat).mean(),    # 橙
-        2: (((hh >= 23) & (hh <= 35)) & sat).mean(),    # 黄
-        1: (((hh >= 36) & (hh <= 85)) & sat).mean(),    # 绿
-    }
-    best = max(shares, key=shares.get)
-    if shares[best] < FRICTION_COLOR_MIN:
-        return 0
-    return best
+    # 带子像素：高饱和 + 够亮（不透明绘制），背景透色达不到
+    band = (ss >= BAR_SAT_MIN) & (vv >= BAR_VAL_MIN)
+    col = band.mean(axis=0)
 
+    # 最长的连续列段（允许 2px 的缝，抗锯齿/刻度线会造成小断裂）
+    best = (0, -1)
+    i = 0
+    n = len(col)
+    while i < n:
+        if col[i] > 0.5:
+            j = i
+            gap = 0
+            k = i
+            while k < n:
+                if col[k] > 0.5:
+                    j = k
+                    gap = 0
+                else:
+                    gap += 1
+                    if gap > 2:
+                        break
+                k += 1
+            if j - i > best[1] - best[0]:
+                best = (i, j)
+            i = k
+        else:
+            i += 1
+
+    w = best[1] - best[0]
+    if w < BAR_MIN_WIDTH:
+        _bar_info.update(level=0, span=None, hue=None, sat=None)
+        return 0, dict(_bar_info)
+
+    # 前缘 = 最右 25%（至少 8 列）
+    n_lead = max(8, int(w * 0.25))
+    lead = band[:, best[1] - n_lead + 1:best[1] + 1]
+    hue = int(np.median(hh[:, best[1] - n_lead + 1:best[1] + 1][lead]))
+    sat = int(np.median(ss[:, best[1] - n_lead + 1:best[1] + 1][lead]))
+
+    if hue <= 10 or hue >= 170:
+        level = 4
+    elif hue <= 22:
+        level = 3
+    elif hue <= 35:
+        level = 2
+    elif hue <= 85:
+        level = 1
+    else:
+        level = 0
+
+    _bar_info.update(level=level, span=(x1 + best[0], x1 + best[1]),
+                     hue=hue, sat=sat)
+    return level, dict(_bar_info)
+
+
+def friction_level() -> int:
+    """兼容旧调用：只要等级。"""
+    return friction_bar_state()[0]
 
 
 def suppress_ime_overlay() -> int:
