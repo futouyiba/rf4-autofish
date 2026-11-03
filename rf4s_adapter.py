@@ -19,6 +19,8 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+
+import friction_state
 import math
 import os
 import sys
@@ -449,11 +451,11 @@ FRICTION_MIN = 1
 FRICTION_ABS_TOP = 30          # 绝对校准时的"顶"（上游 MAX_FRICTION_BRAKE=30）
 FRICTION_DROP_DIV = 3          # 红 -> 降 1/3：17 - 17//3 = 12，16 - 16//3 = 11
 FRICTION_RISE_DIV = 5          # 10 秒全绿 -> 升 1/5：17 + 17//5 = 20（向上滚 3 格）
-FRICTION_WINDOW = 10.0   # 红判据的观察窗口
-FRICTION_MIN_EVAL = 3.0   # 至少攒这么多秒的样本才做判断（10s 窗口对短搏鱼太长）
-FRICTION_RISE_WINDOW = 6.0   # 升档判据的窗口（原来的 10 秒太长，搏鱼往往不到 10 秒）
-FRICTION_RISE_MIN_GREEN = 3  # 窗口内至少这么多次"绿"才认为真的轻松
-FRICTION_SAMPLE = 0.2
+FRICTION_WINDOW = 10.0     # 观察窗口：过去 10 秒
+FRICTION_SAMPLE = 0.2       # 采样间隔
+FRICTION_RISE_GAP = 5.0     # 升档后至少等 5 秒才能再升（玩家 02:41 口述）
+FRICTION_DROP_GAP = 6.0     # 两次降档至少隔 6 秒：一次红事件只降一次
+FRICTION_RISE_MIN_READ = 3  # 升档前窗口内至少 3 次真实读到"最低档"
 FRICTION_SCROLL_GAP = 0.055    # 每格之间的间隔
 FRICTION_LOCK = 0.8            # 调整后锁这么久，避免连续触发
 
@@ -483,6 +485,7 @@ def _wheel(n: int) -> None:
     _wheel_raw(n)
     _fric["cur"] = max(FRICTION_MIN, min(FRICTION_MAX, _fric["cur"] + n))
     _fric["t"] = time.time()
+    friction_state.set(_fric["cur"], calibrated=_fric.get("calibrated", False))
     print(f"[patch] 摩擦片 -> {_fric['cur']} 档（{n:+d}）", flush=True)
 
 
@@ -506,9 +509,11 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
     之前每次抛竿都重置回 17，搏鱼中升上去的档位一下就清零了，
     档位永远停在起点 —— 2026-11-04 玩家指出后改。
     """
-    if _fric.get("calibrated"):
-        # 已校准过：绝对校准只属于脚本启动那一刻，之后的档位由
-        # `_reset_friction_for_fish()`（每条鱼恢复 17）和搏鱼中的增减管理。
+    # 恢复/共享：先看盘上的状态（其他进程可能已经校准过）
+    saved = friction_state.get()
+    if saved is not None:
+        _fric["cur"] = saved
+        _fric["calibrated"] = True
         return
     if not focus_game_quiet():
         print("[patch][warn] 摩擦片绝对校准跳过：游戏窗口没能置前", flush=True)
@@ -519,7 +524,8 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
     _fric["cur"] = target
     _fric["t"] = time.time()
     _fric["calibrated"] = True
-    print(f"[patch] 摩擦片绝对校准 -> {target} 档（仅此一次）", flush=True)
+    friction_state.set(target, calibrated=True)
+    print(f"[patch] 摩擦片绝对校准 -> {target} 档（仅此一次，已落盘）", flush=True)
 
 
 def _reset_friction_for_fish() -> None:
@@ -530,6 +536,7 @@ def _reset_friction_for_fish() -> None:
     相对调整只需要滚 |cur - 17| 格，档位变量是准的（_wheel 统一记账）。
     """
     cur = _fric["cur"]
+    _fric["_last_drop"] = 0.0
     if cur == FRICTION_INITIAL:
         return
     friction_nudge(FRICTION_INITIAL - cur)
@@ -544,53 +551,65 @@ def friction_nudge(delta: int) -> None:
     _wheel(target - _fric["cur"])
 
 
+def _tier(lvl: int) -> int:
+    """四色分类 -> 玩家的三档口径（2026-11-04 02:41）：
+
+      1 档 = 力度最低的颜色（绿/黄，实测 hue 23~35）→ 一直 1 档就升
+      2 档 = 橙（hue 11~22）→ 目标，稳住不动
+      3 档 = 红（hue ≤10 或 ≥170）→ 立刻降
+    分类器 0（空载/松线瞬间）按 1 档对待——松线不该阻止升档判断。
+    """
+    if lvl >= 4:
+        return 3
+    if lvl == 3:
+        return 2
+    return 1
+
+
 def friction_controller_step(win: list) -> None:
-    """搏鱼中的摩擦片控制，目标：**最近 10 秒的 max 落在橙色区**。
+    """搏鱼中的摩擦片控制（三档口径 + 事件去重）。
 
-    玩家 2026-11-04 给的规则（修正了我之前的误解）：
-      * 力度条表示的是**钓具承担的力**，跟"剩余耐力"（那是鱼的耐力）没关系
-      * 条会往两边走：越过第一条刻度线变橙，越过第二条变红
-      * 目标是把 10 秒的 max 稳在橙色：**max 变绿就调大，变红就立刻调小**
-      * 一直绿就一直往上调，但不超过 29 档（档位在 _fric["cur"] 里记着，不会失控）
-
-    所以行为是：
-      max >= 4 红   -> 立刻降 1/3（要有 2/3 帧确认，防背景透色假红）
-      max <= 2 黄绿 -> 升 1/5（每次评估窗口最多升一次）
-      max == 3 橙   -> 命中目标，不动
+    升档：过去 10 秒**全是 1 档**（至少 3 次真实读到）且距上次调整 ≥5s
+          -> 升 1/5（17→20）。升完还绿就接着升（每 5 秒最多一次）。
+    降档：**尾部**最近 3 帧里 ≥2 帧是 3 档（红事件当下确认）
+          且距上次降档 ≥6s -> 降 1/3（17→12）。
+          ⚠️ 不看"窗口里有没有红"：第 9 秒的红降过档之后，第 15 秒回看
+          过去 10s 仍含它，会二次降档把泄力打到地板（玩家 02:45 指出）。
+    橙（2 档）：目标区间，不动。
     """
     now = time.time()
     while win and now - win[0][0] > FRICTION_WINDOW:
         win.pop(0)
     if not win:
         return
-    if now - _fric["t"] < FRICTION_LOCK:      # 刚调过，给游戏一点反应时间
+    if now - _fric["t"] < FRICTION_LOCK:      # 滚轮刚动过，先等生效
         return
 
-    levels = [l for _, l in win]
-    wmax = max(levels)
+    tiers = [(t, _tier(l)) for t, l in win]
 
-    if wmax >= 4:
-        # 红：立刻降。要求最近 3 帧里至少 2 帧红（背景透色常常只有单帧）。
-        tail = [l for _, l in win[-3:]]
-        if tail.count(4) < 2:
-            return
+    # ---- 降档：红事件（尾部确认 + 去重间隔）----
+    tail = [tier for _, tier in tiers[-3:]]
+    if (tail.count(3) >= 2
+            and now - _fric.get("_last_drop", 0.0) >= FRICTION_DROP_GAP):
         target = _drop_target(_fric["cur"])
-        print(f"[patch] 力度到红(max={wmax}) 降档 {_fric['cur']} -> {target}", flush=True)
-        friction_nudge(target - _fric["cur"])
-        win.clear()
+        if target < _fric["cur"]:
+            print(f"[patch] ★红事件 降档 {_fric['cur']} -> {target}"
+                  f"（近10s序列 {[l for _, l in win]}）", flush=True)
+            _fric["_last_drop"] = now
+            friction_nudge(target - _fric["cur"])
         return
 
-    # 绿/黄：负载还不够，往上加。等窗口攒够 MIN_EVAL 秒再判，避免刚咬钩就动手。
-    if now - win[0][0] < FRICTION_MIN_EVAL:
-        return
-    if wmax <= 2:
+    # ---- 升档：过去 10s 全 1 档，且距上次调整 ≥5s ----
+    wmax = max(tier for _, tier in tiers)
+    n_low = sum(1 for _, tier in tiers if tier == 1)
+    if (wmax == 1 and n_low >= FRICTION_RISE_MIN_READ
+            and now - _fric["t"] >= FRICTION_RISE_GAP):
         target = _rise_target(_fric["cur"])
-        if target == _fric["cur"]:
-            return
-        print(f"[patch] 10s max={wmax}(未到橙) 升档 {_fric['cur']} -> {target} "
-              f"| 等级序列 {levels[-20:]}", flush=True)
-        friction_nudge(target - _fric["cur"])
-        win.clear()
+        if target > _fric["cur"]:
+            print(f"[patch] ▲10s全1档 升档 {_fric['cur']} -> {target}"
+                  f"（低档读数 {n_low} 次）", flush=True)
+            friction_nudge(target - _fric["cur"])
+    # wmax == 2（橙 = 目标）：不动
 
 
 def _game_gray():
