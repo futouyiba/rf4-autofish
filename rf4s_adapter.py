@@ -507,8 +507,8 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
     档位永远停在起点 —— 2026-11-04 玩家指出后改。
     """
     if _fric.get("calibrated"):
-        print(f"[patch] 摩擦片保留 {target if False else _fric['cur']} 档（已校准过，不重置）",
-              flush=True)
+        # 已校准过：绝对校准只属于脚本启动那一刻，之后的档位由
+        # `_reset_friction_for_fish()`（每条鱼恢复 17）和搏鱼中的增减管理。
         return
     if not focus_game_quiet():
         print("[patch][warn] 摩擦片绝对校准跳过：游戏窗口没能置前", flush=True)
@@ -520,6 +520,20 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
     _fric["t"] = time.time()
     _fric["calibrated"] = True
     print(f"[patch] 摩擦片绝对校准 -> {target} 档（仅此一次）", flush=True)
+
+
+def _reset_friction_for_fish() -> None:
+    """新的一条鱼开始：把摩擦片**相对**调回 FRICTION_INITIAL。
+
+    不做"滚满 30 再退回"的绝对校准（那个只在脚本启动时做一次）：
+    每条鱼都滚满再退会多花 ~4 秒，而且顶着满档抛竿有断线风险。
+    相对调整只需要滚 |cur - 17| 格，档位变量是准的（_wheel 统一记账）。
+    """
+    cur = _fric["cur"]
+    if cur == FRICTION_INITIAL:
+        return
+    friction_nudge(FRICTION_INITIAL - cur)
+    print(f"[patch] 新的一条鱼：摩擦片恢复 -> {FRICTION_INITIAL} 档", flush=True)
 
 
 def friction_nudge(delta: int) -> None:
@@ -888,6 +902,9 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
         if self.stage != StageId.PULL:
             self.stage = StageId.PULL
             self.timer.set_timeout_start_time()
+        # 每条鱼都从 17 档起步（玩家 2026-11-04 指定：档位调整是**单条鱼**范围内的
+        # 行为 —— 搏鱼中遇红调小、一直绿调大；下一条鱼恢复 17）。
+        _reset_friction_for_fish()
         hold_lift()      # 抬竿全程按住（左键由外层 hold_keys 一直按着）
         start = time.time()
         idle = 0
