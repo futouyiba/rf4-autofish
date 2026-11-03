@@ -347,9 +347,21 @@ def patch_bottom_mode_held():
                         # 所以不必死等 CHECK_DELAY=16s —— 那会让鱼在钩上白挂十几秒。
                         # 改成每 0.4 秒看一眼，咬钩后几乎立刻进搏鱼。
                         waited = 0.0
+                        next_modal_check = 0.0
                         while waited < self.cfg.PROFILE.CHECK_DELAY:
                             if self.detection.is_fish_hooked():
                                 break
+                            # 等口期间也查弹窗：弹窗盖住 HUD 时鱼图标恒 False，
+                            # 不处理就会一直等到连续 3 轮没口然后重抛，白浪费。
+                            if waited >= next_modal_check:
+                                try:
+                                    if maybe_dismiss("等咬钩"):
+                                        waited = 0.0
+                                        next_modal_check = 2.0
+                                        continue
+                                except Exception:
+                                    pass
+                                next_modal_check = waited + 2.0
                             # 看门狗：HUD 连续 15 秒读不出来（线长圆环返回 -1），
                             # 说明画面被菜单/能力解锁弹窗之类盖住了 —— 常规循环
                             # 不可能自己脱困，交给 Agent 看截图决定点哪里。
@@ -510,11 +522,10 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
     之前每次抛竿都重置回 17，搏鱼中升上去的档位一下就清零了，
     档位永远停在起点 —— 2026-11-04 玩家指出后改。
     """
-    # 恢复/共享：先看盘上的状态（其他进程可能已经校准过）
-    saved = friction_state.get()
-    if saved is not None:
-        _fric["cur"] = saved
-        _fric["calibrated"] = True
+    # calibrated 是**本进程**标记，不从盘上恢复：盘上的旧状态可能对应着
+    # 手动动过滚轮 / 游戏重登，不可信。每个会话启动都重新绝对校准一次。
+    # （盘上状态的用途是给接管工具**读**，主脚本只往里写。）
+    if _fric.get("calibrated"):
         return
     if not focus_game_quiet():
         print("[patch][warn] 摩擦片绝对校准跳过：游戏窗口没能置前", flush=True)
@@ -669,12 +680,30 @@ def patch_cast(pdi):
     def cast(self, lock):
         release_lift()                     # 抛竿前把抬竿松开
         time.sleep(0.15)
+        maybe_dismiss("抛竿前")            # 卡牌/技能/升级弹窗会吃掉 Shift+F5
         friction_absolute(FRICTION_INITIAL)   # 唯一一次绝对校准
         self.stage = StageId.CAST
         focus_game_quiet()
 
+        # Shift 必须真的按下去（2026-11-04 事故：焦点被抢时 Shift 落到别的
+        # 窗口，游戏只收到 F5，变成无蓄力短抛）。按下后用 GetAsyncKeyState
+        # 验证，没按上就重新置前再试一次，还不行就放弃这次抛竿等重抛。
+        u = ctypes.windll.user32
         pdi.keyDown("shift")
         time.sleep(0.08)
+        if not (u.GetAsyncKeyState(0x10) & 0x8000):    # VK_SHIFT
+            print("[patch][warn] Shift 没按上（焦点被抢），重试", flush=True)
+            pdi.keyUp("shift")
+            focus_game_quiet()
+            time.sleep(0.2)
+            pdi.keyDown("shift")
+            time.sleep(0.08)
+            if not (u.GetAsyncKeyState(0x10) & 0x8000):
+                pdi.keyUp("shift")
+                print("[patch][warn] Shift 仍未按上，放弃本次抛竿（交给重抛）",
+                      flush=True)
+                self.stage = StageId.RESET
+                return
         pdi.keyDown("f5")
         time.sleep(CAST_HOLD)              # 按住左键 1.0s 蓄力
         pdi.keyUp("f5")
@@ -1450,28 +1479,55 @@ def on_keepnet_full(player) -> None:
     raise KeyboardInterrupt
 
 
-# ---- 通用弹窗「确定」按钮：(871..1048, 793..826)，实测多个弹窗共用这个位置 ----
+# ================= 弹窗「确定」统一处理 =================
+#
+# 这类弹窗在这套客户端里非常多，长得几乎一模一样、而且**排队出现**：
+#   * 获得卡牌（鱼卡）-> 确定
+#   * 获得新技能 / 技能点 -> 确定
+#   * 能力解锁（"使用直排(IN-LINE)钓组"、"使用雪人钓组"…）-> 确定
+#   * 升级（"新级别 27"）-> 确定
+#   * 需要手动点击才能继续的提示框 -> 确定
+#
+# 实测（2026-11-03 ~ 04）：
+#   * 「确定」按钮固定在这个位置：边框 x871..1048、y793..826，中心 (960, 810)
+#   * 点掉一个立刻弹下一个（连锁 4 层都见过），所以必须**连点到按钮消失**
+#   * 用 mouse_event 点无效（客户端丢弃），必须 SendInput（_click_client）
+#   * 弹窗盖住 HUD 时，线长圆环读数为 -1、鱼图标恒为 False —— 这正好是判据
+#
+# 所以策略从"等 Agent 来救"改成"自己先清，清不掉才上报"：
+#   maybe_dismiss() 在被调用的位置（抛竿前/等口时/入护后/抬竿前）先看一眼，
+#   有就点干净；只有点不掉（按钮消失但 HUD 仍不可读 = 不是这类弹窗）才上报 Agent。
 OK_BTN_BOX = (871, 793, 1048, 826)
 OK_BTN_CENTER = (960, 810)
 
 
 def _ok_button_present() -> bool:
-    """检测 (871..1048, 793..826) 处有没有那个「确定」按钮（看上下边框亮线）。"""
-    img, _ = capture_game()
-    a = np.asarray(img.convert("L")).astype(int)
-    x0, y0, x1, y1 = OK_BTN_BOX
-    top = a[y0, x0:x1]
-    bot = a[y1, x0:x1]
-    return int((top >= 150).sum()) > (x1 - x0) * 0.85 and \
-        int((bot >= 150).sum()) > (x1 - x0) * 0.85
+    """检测「确定」按钮在不在。
+
+    判据：按钮上下两条边框线各自的亮像素占比 > 85%。
+    连续两帧都成立才认（防一格闪烁误判成按钮）。
+    """
+    try:
+        for _ in range(2):
+            img, _ = capture_game()
+            a = np.asarray(img.convert("L")).astype(int)
+            x0, y0, x1, y1 = OK_BTN_BOX
+            top = a[y0, x0:x1]
+            bot = a[y1, x0:x1]
+            if not (int((top >= 150).sum()) > (x1 - x0) * 0.85
+                    and int((bot >= 150).sum()) > (x1 - x0) * 0.85):
+                return False
+            time.sleep(0.05)
+        return True
+    except Exception:
+        return False
 
 
 def dismiss_modals(max_clicks: int = 12, gap: float = 0.9) -> bool:
-    """连点「确定」把排队弹窗清空（能力解锁/升级/技能点这类）。
+    """连点「确定」把排队弹窗清空。返回 True 表示清干净了（或本来就没有）。
 
-    这些弹窗**长得一模一样**、而且是排队的：点掉一个立刻弹出下一个，
-    单看点一次会误以为没生效。所以按固定位置连点到按钮消失为止。
-    返回 True 表示清干净了。
+    弹窗是排队的：点掉"新级别 27"立刻弹"+1 免费技能点"，
+    所以要点到按钮消失为止，不能只点一次。
     """
     for i in range(max_clicks):
         if _ok_button_present():
@@ -1482,6 +1538,26 @@ def dismiss_modals(max_clicks: int = 12, gap: float = 0.9) -> bool:
         else:
             return True
     return not _ok_button_present()
+
+
+def maybe_dismiss(tag: str = "", quiet: bool = True) -> bool:
+    """**统一入口**：有弹窗就清掉，没有就几乎零开销返回。
+
+    在流程里这些位置调用：
+      * 抛竿前（弹窗会吃掉 Shift/F5）
+      * 等咬钩的轮询里（弹窗盖住 HUD 时鱼图标恒 False，会一直等到重抛）
+      * 入护之后（卡牌/技能点弹窗就在这之后弹）
+      * 抬竿/收线前
+    返回 True = 这次确实清掉了东西（调用方据此决定要不要重判状态）。
+    """
+    if not _ok_button_present():
+        return False
+    if not quiet:
+        print(f"[patch] 检测到弹窗（{tag}），开始清理", flush=True)
+    ok = dismiss_modals()
+    print(f"[patch] 弹窗清理完成（{tag}）：{'干净' if ok else '没清完，交给上层处理'}",
+          flush=True)
+    return ok
 
 
 # ---- 小退：Esc 回主菜单 -> 按住 Shift 点「退出」-> 回登录界面（玩家给的步骤）----
@@ -1558,6 +1634,12 @@ def patch_handle_fish_click():
         self.result.kept += 1
 
         sleep(add_jitter(0.6))
+        # 入护后最常见的就是「获得卡牌」/「获得技能点」弹窗：它会盖住 HUD，
+        # 让下一轮等口判据失效。这里立刻清掉，别等看门狗 15 秒后才发现。
+        try:
+            maybe_dismiss("入护后")
+        except Exception:
+            pass
         try:
             if self.detection.is_keepnet_full():
                 self.result.kept -= 1
