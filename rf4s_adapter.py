@@ -631,15 +631,19 @@ def friction_controller_step(win: list) -> None:
             win.clear()
         return
 
-    # ---- 升档：只统计 T0 之后的样本（旧档位的数据不算数）----
-    since = [(t, _tier(lvl), lvl) for t, lvl in win if t >= t0 - 0.05]
+    # ---- 升档：只统计 T0 之后的**真实读数** ----
+    # ⚠️ 必须剔除 lvl==0 的样本：那是"力度条无色"＝这一瞬间鱼没在拉（鱼在歇、
+    # 或者线已经收到岸边），它既不能证明"负载低"，也不该参与"一直绿"的判断。
+    # 之前 idle 只有 2 秒时攒不下几个 0，问题被掩盖了；idle 提到 15 秒后一次
+    # 能攒 70+ 个 0，而 _tier(0)==1，会凑出"10 秒全 1 档"导致鱼刚歇完就误升档。
+    since = [(t, _tier(lvl), lvl) for t, lvl in win
+             if t >= t0 - 0.05 and lvl > 0]
     if not since:
-        return
+        return                                 # 这 10 秒全是空档，没有信息量
     s_tiers = [tier for _, tier, _ in since]
     if max(s_tiers) != 1:                      # 有橙/红 → 不是"一直低"
         return
-    n_real_low = sum(1 for _, tier, lvl in since
-                     if tier == 1 and lvl > 0)  # 有色带的真实低档读数
+    n_real_low = len(since)                    # since 里已经全是真实低档读数
     gap = (FRICTION_RECOVER_GAP if _fric.get("_last_action") == "drop"
            else FRICTION_RISE_GAP)
     if (n_real_low >= FRICTION_RISE_MIN_READ
@@ -875,6 +879,17 @@ LIFT_LOST_LIMIT = 8     # 拉力消失连续次数（约 2s）-> 认为鱼跑了
 _lift = {"held": False}
 
 
+def _who() -> str:
+    """调用方是谁（函数@行号），用来定位"谁把键松了"。"""
+    import inspect
+
+    try:
+        f = inspect.stack()[2]
+        return f"{f.function}@{f.lineno}"
+    except Exception:
+        return "?"
+
+
 def hold_lift() -> None:
     """按住抬竿（右键 -> F6），幂等。"""
     if _lift["held"]:
@@ -884,6 +899,7 @@ def hold_lift() -> None:
     pdi.FAILSAFE = False
     pdi.keyDown(LIFT_KEY)
     _lift["held"] = True
+    print(f"[KEY] F6 按下 (by {_who()})", flush=True)
 
 
 def release_lift() -> None:
@@ -894,6 +910,7 @@ def release_lift() -> None:
 
     pdi.keyUp(LIFT_KEY)
     _lift["held"] = False
+    print(f"[KEY] F6 松开 (by {_who()})", flush=True)
 
 
 # ================= 线长圆环（spool 图标外圈 = 线长进度）=================
@@ -980,6 +997,8 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
 
     def pull(self) -> None:
         logger.info("Pulling fish (continuous, reel + lift, friction control)")
+        _t_pull = time.time()
+        print(f"[FLOW] pull 进入（档位 {_fric['cur']}）", flush=True)
         if self.stage != StageId.PULL:
             self.stage = StageId.PULL
             self.timer.set_timeout_start_time()
@@ -1069,18 +1088,21 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
                     if idle_since is None:
                         idle_since = time.time()
                     elif time.time() - idle_since >= PULL_IDLE_SECS:
-                        print(f"[patch] 力度条持续无色 {PULL_IDLE_SECS:.0f}s，"
-                              f"结束搏鱼（转抬竿上鱼）", flush=True)
+                        print(f"[FLOW] pull 退出：力度条持续无色 "
+                              f"{PULL_IDLE_SECS:.0f}s（历时 {time.time()-_t_pull:.1f}s）",
+                              flush=True)
                         return
 
                 if time.time() - start > timeout:
-                    print(f"[patch] 搏鱼收线超过 {timeout:.0f}s，结束本轮", flush=True)
+                    print(f"[FLOW] pull 退出：超时 {timeout:.0f}s", flush=True)
                     return
 
                 sleep(FRICTION_SAMPLE)
                 # 底钓不需要 coffee / gear ratio 检查：
                 # 它们会在循环里反复抛异常被 error_handler 吞掉，导致 pull 被反复重入。
         finally:
+            print(f"[FLOW] pull 结束（历时 {time.time()-_t_pull:.1f}s，"
+                  f"档位 {_fric['cur']}）", flush=True)
             release_lift()
 
     Tackle.pull = pull
@@ -1119,6 +1141,8 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
 
     def lift_fish(self) -> None:
         logger.info("Lifting fish (hold left + right)")
+        _t_lift = time.time()
+        print("[FLOW] lift_fish 进入（左右键将按住）", flush=True)
         # 进来时先看一眼:有鱼就不许用"4 秒无信号"提前放弃 ——
         # 鱼被拉到岸边时本来就没有张力(力度条全灰),只有图标还亮着。
         try:
@@ -1160,6 +1184,8 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                 sleep(LIFT_POLL)
         finally:
             _both_up()
+            print(f"[FLOW] lift_fish 松开左右键（历时 {time.time()-_t_lift:.1f}s，"
+                  f"captured={captured}）", flush=True)
 
         if not captured:
             sleep(0.2)
@@ -1593,6 +1619,63 @@ def quick_relog() -> None:
     print("[patch] 已小退到登录界面，请重新登录", flush=True)
 
 
+def patch_key_watch():
+    """只加日志：记录左键(mouse_pressed)变化、以及 error_handler 吞掉了什么异常。
+
+    目的：查"搏鱼中左右键莫名松开"到底是谁干的。可能来源：
+      * 我们自己的 idle 判据误判搏鱼结束（已改成 15 秒）
+      * 上游 error_handler 捕获 LiftTimeoutError -> hold_keys(mouse=False, reset=True)
+        -> 强制松键再重入 pull_fish（player.py:490）
+      * 上游 lift/pull 内部用 hold_mouse_button(N) 的脉冲式按松（tackle.py:190）
+    加完日志跑一轮，看 [KEY]/[EXC] 的时序就能定案，不靠猜。
+
+    ⚠️ 上游这两个都是 @contextmanager，包装时也必须用 @contextmanager，
+    否则调用方 `with` 会报 "generator object does not support the context manager protocol"。
+    """
+    from contextlib import contextmanager
+
+    from rf4s.controller.player import Player
+
+    orig_hold_keys = Player.hold_keys
+    orig_err = Player.error_handler
+
+    @contextmanager
+    def hold_keys(self, mouse, shift, reset=False):
+        before = getattr(self, "mouse_pressed", None)
+        with orig_hold_keys(self, mouse, shift, reset):
+            after = getattr(self, "mouse_pressed", None)
+            if before != after:
+                print(f"[KEY] 左键 {'按下' if after else '松开'} "
+                      f"(hold_keys mouse={mouse} shift={shift} reset={reset} "
+                      f"by {_who()})", flush=True)
+            yield
+        final = getattr(self, "mouse_pressed", None)
+        if final != after:
+            print(f"[KEY] 左键 {'按下' if final else '松开'} "
+                  f"(hold_keys 退出 reset={reset} by {_who()})", flush=True)
+
+    @contextmanager
+    def error_handler(self):
+        import traceback
+
+        try:
+            with orig_err(self):
+                yield
+        except Exception as e:
+            print(f"[EXC] error_handler 捕获 {type(e).__name__}: {e}", flush=True)
+            try:
+                print("[EXC] 调用栈: " + " <- ".join(
+                    f"{fr.name}:{fr.lineno}" for fr in
+                    traceback.extract_stack()[-6:-1]), flush=True)
+            except Exception:
+                pass
+            raise
+
+    Player.hold_keys = hold_keys
+    Player.error_handler = error_handler
+    print("[patch] 键状态日志已启用（[KEY] 按下/松开、[EXC] 被吞掉的异常）")
+
+
 def patch_handle_fish_click():
     """`_handle_fish()` 改成**点「入护」按钮**，不再按空格。
 
@@ -1873,6 +1956,7 @@ def main():
     patch_fish_hooked_bar()
     patch_fish_captured()
     patch_handle_fish_click()
+    patch_key_watch()
     patch_single_rod(pag, pdi)
     patch_bottom_mode_held()
 
