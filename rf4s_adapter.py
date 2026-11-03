@@ -453,7 +453,8 @@ FRICTION_DROP_DIV = 3          # 红 -> 降 1/3：17 - 17//3 = 12，16 - 16//3 =
 FRICTION_RISE_DIV = 5          # 10 秒全绿 -> 升 1/5：17 + 17//5 = 20（向上滚 3 格）
 FRICTION_WINDOW = 10.0     # 观察窗口：过去 10 秒
 FRICTION_SAMPLE = 0.2       # 采样间隔
-FRICTION_RISE_GAP = 5.0     # 升档后至少等 5 秒才能再升（玩家 02:41 口述）
+FRICTION_RISE_GAP = 5.0     # 升档后再升的最短间隔（玩家 02:41：升完过5s再看）
+FRICTION_RECOVER_GAP = 10.0  # 降档后再升的最短间隔（红事件后谨慎恢复，防震荡）
 FRICTION_DROP_GAP = 6.0     # 两次降档至少隔 6 秒：一次红事件只降一次
 FRICTION_RISE_MIN_READ = 3  # 升档前窗口内至少 3 次真实读到"最低档"
 FRICTION_SCROLL_GAP = 0.055    # 每格之间的间隔
@@ -567,15 +568,32 @@ def _tier(lvl: int) -> int:
 
 
 def friction_controller_step(win: list) -> None:
-    """搏鱼中的摩擦片控制（三档口径 + 事件去重）。
+    """搏鱼中的摩擦片控制（2026-11-04 03:02 定稿：降=事件驱动，升=状态驱动）。
 
-    升档：过去 10 秒**全是 1 档**（至少 3 次真实读到）且距上次调整 ≥5s
-          -> 升 1/5（17→20）。升完还绿就接着升（每 5 秒最多一次）。
-    降档：**尾部**最近 3 帧里 ≥2 帧是 3 档（红事件当下确认）
-          且距上次降档 ≥6s -> 降 1/3（17→12）。
-          ⚠️ 不看"窗口里有没有红"：第 9 秒的红降过档之后，第 15 秒回看
-          过去 10s 仍含它，会二次降档把泄力打到地板（玩家 02:45 指出）。
-    橙（2 档）：目标区间，不动。
+    ## 为什么两个方向用不同的算法
+
+    **降档（红）是"事件"**：红的语义是"现在正在超载"，是紧急信号。
+    看历史窗口反而有害 —— 第 9 秒红过一次降了档，第 14 秒回看"过去 10s"
+    仍含那次红，会二次降档把泄力打到地板（玩家指出的陷阱）。
+    所以降档只看**当下尾部**，配冷却期。
+
+    **升档（绿）是"状态"**："一直绿"是持续轻松的判断，必须看一段历史。
+    但窗口起点 = **上次调整时刻 T0**（玩家指定）：T0 之前的样本反映的是
+    旧档位下的力度，混进来会把判断带偏。
+
+    ## 规则
+
+    降档（尾部确认 + 冷却）：
+      * 最近 3 帧（~0.6s）里 ≥2 帧是 3 档（红）→ 立刻降 1/3（17→12→8…）
+      * 距上次降档 <6s 不降（同一红事件去重；6s 后仍红则说明鱼真的强，再降）
+
+    升档（只看 T0 之后的数据）：
+      * 窗口 = [T0, now]，全部为 1 档（出现橙=命中目标不升；出现红走降档）
+      * 真实读到 1 档（有色带）≥3 次；松线空读不算数但也不阻断
+      * 距 T0：上次动作是升档 → ≥5s；上次动作是降档 → ≥10s（红后谨慎恢复）
+      * 动作：升 1/5（17→20），上限 29
+
+    每次调整后清空样本窗口，从 T0 重新累计。
     """
     now = time.time()
     while win and now - win[0][0] > FRICTION_WINDOW:
@@ -585,31 +603,45 @@ def friction_controller_step(win: list) -> None:
     if now - _fric["t"] < FRICTION_LOCK:      # 滚轮刚动过，先等生效
         return
 
+    t0 = _fric["t"]                            # 上次调整时刻
     tiers = [(t, _tier(l)) for t, l in win]
 
-    # ---- 降档：红事件（尾部确认 + 去重间隔）----
+    # ---- 降档：红事件（只看当下尾部 + 冷却去重）----
     tail = [tier for _, tier in tiers[-3:]]
     if (tail.count(3) >= 2
             and now - _fric.get("_last_drop", 0.0) >= FRICTION_DROP_GAP):
         target = _drop_target(_fric["cur"])
         if target < _fric["cur"]:
             print(f"[patch] ★红事件 降档 {_fric['cur']} -> {target}"
-                  f"（近10s序列 {[l for _, l in win]}）", flush=True)
+                  f"（尾部3帧 {tail}）", flush=True)
             _fric["_last_drop"] = now
-            friction_nudge(target - _fric["cur"])
+            _fric["_last_action"] = "drop"
+            friction_nudge(target - _fric["cur"])   # nudge 更新 _fric["t"]
+            win.clear()
         return
 
-    # ---- 升档：过去 10s 全 1 档，且距上次调整 ≥5s ----
-    wmax = max(tier for _, tier in tiers)
-    n_low = sum(1 for _, tier in tiers if tier == 1)
-    if (wmax == 1 and n_low >= FRICTION_RISE_MIN_READ
-            and now - _fric["t"] >= FRICTION_RISE_GAP):
+    # ---- 升档：只统计 T0 之后的样本（旧档位的数据不算数）----
+    since = [(t, _tier(lvl), lvl) for t, lvl in win if t >= t0 - 0.05]
+    if not since:
+        return
+    s_tiers = [tier for _, tier, _ in since]
+    if max(s_tiers) != 1:                      # 有橙/红 → 不是"一直低"
+        return
+    n_real_low = sum(1 for _, tier, lvl in since
+                     if tier == 1 and lvl > 0)  # 有色带的真实低档读数
+    gap = (FRICTION_RECOVER_GAP if _fric.get("_last_action") == "drop"
+           else FRICTION_RISE_GAP)
+    if (n_real_low >= FRICTION_RISE_MIN_READ
+            and now - t0 >= gap):
         target = _rise_target(_fric["cur"])
         if target > _fric["cur"]:
-            print(f"[patch] ▲10s全1档 升档 {_fric['cur']} -> {target}"
-                  f"（低档读数 {n_low} 次）", flush=True)
+            print(f"[patch] ▲调整后全1档 升档 {_fric['cur']} -> {target}"
+                  f"（T0后真实低档读数 {n_real_low} 次，距T0 {now - t0:.1f}s）",
+                  flush=True)
+            _fric["_last_action"] = "rise"
             friction_nudge(target - _fric["cur"])
-    # wmax == 2（橙 = 目标）：不动
+            win.clear()
+    # max == 2（橙 = 目标）：不动
 
 
 def _game_gray():
