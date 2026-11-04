@@ -1,0 +1,213 @@
+"""Commonly used helper functions goes here."""
+
+import ctypes
+import datetime
+import msvcrt
+import random
+import sys
+import logging
+import logging.config
+from time import sleep
+
+import pyautogui as pag
+import rich.logging  # noqa: F401
+from pyscreeze import Box
+from rich import box, print
+from rich.panel import Panel
+
+from rf4s.controller.console import console
+
+LOOP_DELAY = 1
+
+ANIMATION_DELAY = 0.5
+
+
+JITTER_SCALE = 0.05
+
+random.seed(datetime.datetime.now().timestamp())
+
+
+def setup_logging() -> logging.Logger:
+    logging_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        # "filters": {}
+        "formatters": {
+            # RichHandler do the job for us, so we don't need to incldue time & level
+            "iso-8601-simple": {
+                "format": "%(message)s",
+                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+            },
+            "iso-8601-detailed": {
+                "format": "%(asctime)s [%(levelname)s] %(message)s",
+                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+            },
+        },
+        "handlers": {
+            "stdout": {
+                "level": "INFO",
+                "formatter": "iso-8601-simple",
+                "()": "rich.logging.RichHandler",
+                "rich_tracebacks": True,
+            },
+            "file": {
+                "class": "logging.handlers.RotatingFileHandler",
+                "level": "INFO",
+                "formatter": "iso-8601-detailed",
+                "filename": "logs/.log",
+                "maxBytes": 10000,
+                "backupCount": 0,
+            },
+        },
+        "loggers": {"root": {"level": "INFO", "handlers": ["stdout", "file"]}},
+    }
+    logging.config.dictConfig(config=logging_config)
+    return logging.getLogger(__name__)
+
+
+def add_jitter(time: float, jitter_scale: float = JITTER_SCALE) -> float:
+    return random.uniform(time - jitter_scale * time, time + jitter_scale * time)
+
+
+# ---------------------------------------------------------------------------- #
+#                            common functionalities                            #
+# ---------------------------------------------------------------------------- #
+def ask_for_confirmation(msg: str = "Ready to start") -> None:
+    """Ask for confirmation of user settings if it's enabled.
+
+    :param msg: Confirmation message, defaults to "Ready to start".
+    :type msg: str
+    """
+    while True:
+        ans = input(f"{msg}? [Y/n] ").strip().lower()
+        if ans in ("y", ""):
+            break
+        if ans == "n":
+            sys.exit()
+
+
+def get_box_center_integers(box: Box) -> tuple[int, int]:
+    """Get the center coordinate (x, y) of the given box.
+
+    # (x, y, w, h) -> (x, y), np.int64 -> int
+
+    :param box: Box coordinates (x, y, w, h).
+    :type box: Box
+    :return: x and y coordinates of the center point.
+    :rtype: tuple[int, int]
+    """
+    return int(box.left + box.width // 2), int(box.top + box.height // 2)
+
+
+# ---------------------------------------------------------------------------- #
+#                                  decorators                                  #
+# ---------------------------------------------------------------------------- #
+def toggle_right_mouse_button(func):
+    """Toggle right mouse button before and after calling the function."""
+
+    def wrapper(*args, **kwargs):
+        pag.mouseDown(button="right")
+        try:
+            func(*args, **kwargs)
+        finally:
+            pag.mouseUp(button="right")
+
+    return wrapper
+
+
+def press_before_and_after(key):
+    def func_wrapper(func):
+        def args_wrapper(*args, **kwargs):
+            pag.press(key)
+
+            sleep(add_jitter(ANIMATION_DELAY))
+            try:
+                func(*args, **kwargs)
+            finally:
+                pag.press(key)
+                sleep(add_jitter(ANIMATION_DELAY))
+
+        return args_wrapper
+
+    return func_wrapper
+
+
+def press(key: str) -> None:
+    """Custom wrapper to replace pyautogui.press().
+
+    pyautogui.press() calls keyDown() and keyUp() without delay in between.
+    This caused a weird bug that the game processes pyautogui.press() two times, which
+    cause the player to put away the rod after releasing a fish by pressing backspace.
+    Here we use internal _pause (0.1s) to avoid that.
+
+    :param key: Key to press
+    :type key: str
+    """
+    pag.keyDown(key)
+    pag.keyUp(key)
+
+
+def is_compiled():
+    return "__compiled__" in globals()  # Nuitka style
+
+
+def is_run_by_clicking():
+    # Load kernel32.dll
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Create an array to store the processes in.  This doesn't actually need to
+    # be large enough to store the whole process list since GetConsoleProcessList()
+    # just returns the number of processes if the array is too small.
+    process_array = (ctypes.c_uint * 1)()
+    num_processes = kernel32.GetConsoleProcessList(process_array, 1)
+    # num_processes may be 1 if your compiled program doesn't have a launcher/wrapper.
+    # If run from Python interpreter, num_processes would also be 2
+    # We also need to check if it's an executable to make it work
+    return is_compiled() and num_processes == 2
+
+
+def print_logo_box(logo: str) -> None:
+    print(Panel.fit(logo, box=box.HEAVY, style="bright_white"))
+
+
+def print_header_box(logo: str) -> None:
+    print(Panel.fit(logo, style="bright_white"))
+
+
+def print_usage_box(msg: str) -> None:
+    print(Panel.fit(msg, style="steel_blue1"))
+
+
+def print_description_box(msg: str) -> None:
+    print(Panel.fit(f"You're now using: {msg}"))
+
+
+def print_hint_box(msg: str) -> None:
+    print(Panel.fit(f"Hint: {msg}", style="green"))
+
+
+def print_error(msg: str) -> None:
+    console.print(msg, style="red")
+
+
+def check_quit(s: str) -> None:
+    if s.lower() == "q":
+        goodbye()
+
+
+def goodbye():
+    print("Bye.")
+    exit()
+
+
+def safe_exit():
+    if is_run_by_clicking():
+        print_usage_box("Press any key to quit.")
+        # KeyboardInterrupt will mess with stdin, input will crash silently
+        # Use msvcrt.getch() because it doesn't depends on stdin
+        msvcrt.getch()
+    # Skip this because it will trigger a right click to open context menu
+    # pag.mouseUp(button="right", _pause=False)
+    pag.keyUp("w", _pause=False)
+    pag.keyUp("a", _pause=False)
+    pag.keyUp("d", _pause=False)
+    sys.exit()
