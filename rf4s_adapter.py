@@ -142,7 +142,7 @@ def restore_window(h: int) -> None:
 
 # ========================= 截图层：PrintWindow 合成 =========================
 _cache = {"t": 0.0, "img": None}
-CACHE_TTL = 0.10
+CACHE_TTL = 0.30   # P1(review): 必须 > FRICTION_SAMPLE(0.2)，否则三处读数各截各的图，采样节奏失真
 
 
 def _vorigin():
@@ -475,7 +475,22 @@ FRICTION_RISE_MIN_READ = 3  # 升档前窗口内至少 3 次真实读到"最低�
 FRICTION_SCROLL_GAP = 0.055    # 每格之间的间隔
 FRICTION_LOCK = 0.8            # 调整后锁这么久，避免连续触发
 
-_fric = {"cur": FRICTION_INITIAL, "t": 0.0, "calibrated": False}
+# 启动时优先用盘上保存的档位（friction.state，由上次会话写入）。
+# ⚠️ 2026-11-04 review A1.1：之前硬编码 17，脚本重启后游戏侧实际档位可能是任意值，
+# 记账从第一秒起就错。落盘文件若存在且标记已校准，就用它；否则等第一次抛竿校准。
+def _init_fric():
+    try:
+        import friction_state
+        saved = friction_state.get()
+        if saved is not None:
+            return {"cur": saved, "t": 0.0, "calibrated": True,
+                    "_restored": True}
+    except Exception:
+        pass
+    return {"cur": FRICTION_INITIAL, "t": 0.0, "calibrated": False}
+
+
+_fric = _init_fric()
 
 
 def _drop_target(cur: int) -> int:
@@ -498,24 +513,35 @@ def _wheel(n: int) -> None:
     玩家确认（2026-11-04）：这套滚轮方式一直是有效的（抛竿前"滚满 30 再退回 17"
     那套绝对校准就是用它做的），所以保持原样。
     """
-    _wheel_raw(n)
+    # A1.3（review）：置前失败 = 一格没滚 = 绝不能记账，还要标记档位不可信，
+    # 强制下次抛竿重新绝对校准。
+    if not _wheel_raw(n):
+        try:
+            friction_state.invalidate()
+        except Exception:
+            pass
+        _fric["calibrated"] = False
+        print("[patch][warn] 滚轮未送达，档位标记为不可信（下竿前将重新校准）",
+              flush=True)
+        return
     _fric["cur"] = max(FRICTION_MIN, min(FRICTION_MAX, _fric["cur"] + n))
     _fric["t"] = time.time()
     friction_state.set(_fric["cur"], calibrated=_fric.get("calibrated", False))
     print(f"[patch] 摩擦片 -> {_fric['cur']} 档（{n:+d}）", flush=True)
 
 
-def _wheel_raw(n: int) -> None:
-    """只发滚轮事件，不记账（绝对校准内部用：它的档位由调用方设定）。"""
+def _wheel_raw(n: int) -> bool:
+    """只发滚轮事件，不记账。返回是否真的滚了（False=窗口没置前，一格没滚）。"""
     if n == 0:
-        return
+        return True
     if not focus_game_quiet():
         print("[patch][warn] 滚轮跳过：游戏窗口没能置前", flush=True)
-        return
+        return False
     delta = 120 if n > 0 else -120
     for _ in range(abs(n)):
         ctypes.windll.user32.mouse_event(0x0800, 0, 0, delta, 0)   # MOUSEEVENTF_WHEEL
         time.sleep(FRICTION_SCROLL_GAP)
+    return True
 
 
 def friction_absolute(target: int = FRICTION_INITIAL) -> None:
@@ -533,9 +559,28 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
     if not focus_game_quiet():
         print("[patch][warn] 摩擦片绝对校准跳过：游戏窗口没能置前", flush=True)
         return
-    _wheel_raw(FRICTION_ABS_TOP)
+    # A2（review）：滚满 30 之前的硬守卫——线上有鱼时顶满档会直接断线。
+    # 正常抛竿流程到不了这里，但"人工上鱼等待超时后鱼仍挂着"等边角路径会。
+    try:
+        if fish_icon_present():
+            print("[patch][warn] 鱼还在钩上，跳过绝对校准（标记待重校准）",
+                  flush=True)
+            _fric["calibrated"] = False
+            return
+    except Exception:
+        pass
+    if not _wheel_raw(FRICTION_ABS_TOP):
+        return
     time.sleep(0.2)
-    _wheel_raw(-(FRICTION_ABS_TOP - target))
+    if not _wheel_raw(-(FRICTION_ABS_TOP - target)):
+        # 退档失败：此时游戏在 30 顶格，绝不能记成 target
+        _fric["calibrated"] = False
+        try:
+            friction_state.invalidate()
+        except Exception:
+            pass
+        print("[patch][warn] 退档失败，游戏仍在顶格，标记待重校准", flush=True)
+        return
     _fric["cur"] = target
     _fric["t"] = time.time()
     _fric["calibrated"] = True
@@ -550,8 +595,15 @@ def _reset_friction_for_fish() -> None:
     每条鱼都滚满再退会多花 ~4 秒，而且顶着满档抛竿有断线风险。
     相对调整只需要滚 |cur - 17| 格，档位变量是准的（_wheel 统一记账）。
     """
+    # A1.2（2026-11-04 review）：基线未知时宁可不调，也不能瞎调——
+    # 冷启动第一条鱼若来得比第一次 cast 还早，相对滚动会在错误基线上进行。
+    if not _fric.get("calibrated"):
+        print("[patch][warn] 档位未校准，跳过恢复（等下一次抛竿前绝对校准）",
+              flush=True)
+        return
     cur = _fric["cur"]
     _fric["_last_drop"] = 0.0
+    _fric.pop("_last_action", None)   # L5：跨鱼残留会让升档白等 10s
     if cur == FRICTION_INITIAL:
         return
     friction_nudge(FRICTION_INITIAL - cur)
@@ -1019,6 +1071,16 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
         logger.info("Pulling fish (continuous, reel + lift, friction control)")
         _t_pull = time.time()
         print(f"[FLOW] pull 进入（档位 {_fric['cur']}）", flush=True)
+        # A3（review）：清掉"收线 45 秒"计时器的残留。挂在 pull 入口而不是只挂 cast，
+        # 因为 FishHookedError 重入路径（player.py:181）不经过 cast，旧 t0 会让
+        # is_retrieval_finished 立即返回 True、整个搏鱼被跳过。
+        try:
+            from rf4s.controller.detection import Detection
+            rd = getattr(Detection.is_retrieval_finished, "reset_deadline", None)
+            if rd:
+                rd()
+        except Exception:
+            pass
         if self.stage != StageId.PULL:
             self.stage = StageId.PULL
             self.timer.set_timeout_start_time()
@@ -1033,15 +1095,38 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
         ring_high_since = None
         low_streak = 0
         last_ring_log = 0.0
+        _snag_hits = 0
         try:
             while True:
                 if self.detection.is_fish_captured():
                     raise exceptions.FishCapturedError
 
+                # A4（review）：上游 is_line_at_end/snagged 是**单像素颜色比对**，
+                # 大鱼正常冲线也会触发，外层 loop_restart_handler 会直接
+                # general_quit（退出游戏！）——绝不能放行。
+                # 改为：内部消化——线到头就泄力 3 档自保，卡底连续 3 帧才算数。
                 if self.cfg.BOT.SPOOLING_DETECTION and self.detection.is_line_at_end():
-                    raise exceptions.LineAtEndError
+                    if time.time() - _fric.get("t", 0) > 1.0 and _fric["cur"] > FRICTION_MIN + 2:
+                        print("[patch] 线到头警告，泄力自保 -3 档", flush=True)
+                        friction_nudge(-3)
+                    elif _fric["cur"] <= FRICTION_MIN + 2:
+                        import agent_hook
+                        print("[patch] 线到头且档位已到底，上报 Agent", flush=True)
+                        agent_hook.escalate("line_at_end",
+                                            "线到头且泄力已到底",
+                                            {"friction": _fric["cur"]},
+                                            timeout=60.0)
                 if self.cfg.BOT.SNAG_DETECTION and self.detection.is_line_snagged():
-                    raise exceptions.LineSnaggedError
+                    _snag_hits += 1
+                    if _snag_hits >= 3:
+                        import agent_hook
+                        print("[patch] 连续 3 帧卡底，上报 Agent", flush=True)
+                        agent_hook.escalate("line_snagged",
+                                            "连续 3 帧判定卡底",
+                                            {}, timeout=60.0)
+                        _snag_hits = 0
+                else:
+                    _snag_hits = 0
                 if self.timer.is_rare_event_checkable():
                     self.check_rare_events()
 
@@ -1102,16 +1187,28 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
                 # 判成"搏鱼结束"，于是松开左右键、转进抬竿阶段再重新按住，
                 # 玩家看到的就是"钓着钓着键松一下又按回来"（2026-11-04 04:18 反馈）。
                 # 改成按真实秒数计时，阈值给到 15 秒：正常鱼停顿不会这么久。
+                # L2（review）：力度条无色且**鱼图标也消失**才算搏鱼结束。
+                # 只看力度条会在"鱼贴岸歇力（图标还在、张力为 0）"时误退出，
+                # 然后 retrieve_line 又因图标在而重入 pull —— 15 秒一轮的松/按振荡。
                 if lvl > 0:
                     idle_since = None
                 else:
                     if idle_since is None:
                         idle_since = time.time()
                     elif time.time() - idle_since >= PULL_IDLE_SECS:
-                        print(f"[FLOW] pull 退出：力度条持续无色 "
-                              f"{PULL_IDLE_SECS:.0f}s（历时 {time.time()-_t_pull:.1f}s）",
-                              flush=True)
-                        return
+                        try:
+                            still_there = fish_icon_present()
+                        except Exception:
+                            still_there = True
+                        if still_there:
+                            print(f"[patch] 无张力 {PULL_IDLE_SECS:.0f}s 但鱼图标还在"
+                                  f"（贴岸歇力），继续按住", flush=True)
+                            idle_since = time.time()   # 重计，继续等
+                        else:
+                            print(f"[FLOW] pull 退出：无张力 {PULL_IDLE_SECS:.0f}s "
+                                  f"且鱼图标消失（历时 {time.time()-_t_pull:.1f}s）",
+                                  flush=True)
+                            return
 
                 if time.time() - start > timeout:
                     print(f"[FLOW] pull 退出：超时 {timeout:.0f}s", flush=True)
@@ -1120,10 +1217,16 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
                 sleep(FRICTION_SAMPLE)
                 # 底钓不需要 coffee / gear ratio 检查：
                 # 它们会在循环里反复抛异常被 error_handler 吞掉，导致 pull 被反复重入。
+        except BaseException:
+            # L1（review）：只有异常路径才松抬竿。正常收完（return）不松——
+            # pull → lift_fish 之间有 6 秒 SPOOL_RETRIEVAL_DELAY，此时松 F6
+            # 竿会放平一次，正是玩家看到的"不连贯"。lift_fish 的 _both_down
+            # 是幂等的，重复按住无害。
+            release_lift()
+            raise
         finally:
             print(f"[FLOW] pull 结束（历时 {time.time()-_t_pull:.1f}s，"
                   f"档位 {_fric['cur']}）", flush=True)
-            release_lift()
 
     Tackle.pull = pull
     print("[patch] 搏鱼：全程按住左右键 + 10s 窗口摩擦片控制"
@@ -1148,16 +1251,23 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
     from rf4s.component.logger import logger
     from rf4s.controller.player import Player
 
-    def _both_down():
+    def _both_down(self=None):
         import pydirectinput as pdi
         pdi.FAILSAFE = False
         pdi.keyDown("f5")
         hold_lift()
+        if self is not None:
+            self.mouse_pressed = True
 
-    def _both_up():
+    def _both_up(self=None):
         import pydirectinput as pdi
         pdi.keyUp("f5")
         release_lift()
+        # A6（review）：直接 keyUp 绕过了 Player.mouse_pressed 记账。
+        # 若不平账，下一条鱼 hold_keys(mouse=True) 看到 True 不会再按键，
+        # 整场搏鱼 F5 都没按住。
+        if self is not None:
+            self.mouse_pressed = False
 
     def lift_fish(self) -> None:
         logger.info("Lifting fish (hold left + right)")
@@ -1169,7 +1279,7 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
             had_fish = fish_icon_present()
         except Exception:
             had_fish = True
-        _both_down()                       # 左右键一起按住，一路到收完
+        _both_down(self)                    # 左右键一起按住，一路到收完
         t0 = time.time()
         confirmed = had_fish
         lost = 0
@@ -1203,7 +1313,7 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                     break
                 sleep(LIFT_POLL)
         finally:
-            _both_up()
+            _both_up(self)
             print(f"[FLOW] lift_fish 松开左右键（历时 {time.time()-_t_lift:.1f}s，"
                   f"captured={captured}）", flush=True)
 
@@ -1639,6 +1749,22 @@ def quick_relog() -> None:
     print("[patch] 已小退到登录界面，请重新登录", flush=True)
 
 
+def patch_reject_friction_brake():
+    """A5（review）：上游 FrictionBrake 子进程会独立滚轮（绕过记账），
+    和适配层的摩擦片控制互相残杀。检测到就拒绝启动。"""
+    import rf4s.config.config as _cfg
+
+    try:
+        if _cfg.cfg.ARGS.FRICTION_BRAKE:
+            raise SystemExit(
+                "[patch] 检测到 --friction-brake/-FB：上游 FrictionBrake 子进程\n"
+                "       会独立滚轮且绕过档位记账，与适配层的摩擦片控制冲突。\n"
+                "       请去掉 -FB 再启动（适配层自带更精细的摩擦片控制）。")
+    except AttributeError:
+        pass
+    print("[patch] 已确认未启用上游 FrictionBrake（-FB），档位记账唯一）")
+
+
 def patch_key_watch():
     """只加日志：记录左键(mouse_pressed)变化、以及 error_handler 吞掉了什么异常。
 
@@ -1817,7 +1943,10 @@ def _log_bar_sample(level, info):
         _fric_log["fh"].write(
             f"{t:.2f},{level},{span[0]},{span[1]},{info.get('hue','')},"
             f"{info.get('sat','')},{_fric['cur']}\n")
-        _fric_log["fh"].flush()
+        # P3(review)：每 1 秒 flush 一次就够（每 0.2s 同步刷盘是多余 IO）
+        if t - _fric_log.get("last_flush", -1.0) >= 1.0:
+            _fric_log["fh"].flush()
+            _fric_log["last_flush"] = t
     except Exception:
         pass
 
@@ -1981,6 +2110,7 @@ def main():
     patch_fish_hooked_bar()
     patch_fish_captured()
     patch_handle_fish_click()
+    patch_reject_friction_brake()
     patch_key_watch()
     patch_single_rod(pag, pdi)
     patch_bottom_mode_held()
