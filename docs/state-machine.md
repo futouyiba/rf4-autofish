@@ -214,9 +214,11 @@ MVP 的安全策略：
 - `autofish_observation.py`：同一帧提取鱼图标、力度条、线长圆环、结算框、确定弹窗和 HUD；不可读统一为 `None/UNKNOWN`
 - `autofish_state.py`：纯状态候选 + 连续帧防抖（FIGHT 2 帧、LAND 3 帧、UNKNOWN 5 帧等）
 - `tests/test_observation.py` / `tests/test_state_shadow.py`：54 个合成图与逻辑测试
-- 两个模块源码均没有截图、焦点或键鼠输入入口；`rf4s_adapter.py` 未接入、未修改
+- 两个纯模块源码均没有截图、焦点或键鼠输入入口
+- `autofish_shadow.py` 已以 shadow 模式接入 `rf4s_adapter.py`：只输出 `[STATE]` 日志，返回值在所有接入点均无人使用
+- shadow 抓帧全局最多 **2Hz**（`RF4_SHADOW_SAMPLE_S` 默认 0.5s），限频发生在 PrintWindow 之前；`RF4_SHADOW_STATE=0` 可零开销关闭
 
-主 Agent 审查后额外补了：`Observation.evidence` 深冻结快照，以及 pending 状态不虚增 `stable_frames`。
+主 Agent 审查后额外补了：`Observation.evidence` 深冻结快照、pending 状态不虚增 `stable_frames`，以及 shadow 全局抓帧限频（防 pull 0.2s 循环额外 PrintWindow 5Hz）。
 
 ## 9. 实施顺序（复审后修订）
 

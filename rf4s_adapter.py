@@ -195,6 +195,81 @@ def capture_game():
     return img, (pt.x, pt.y)
 
 
+# ================= 只读 shadow 状态观测（阶段 1，纯观察） =================
+# 约束：这一段只抓一帧 + 打日志。**不参与任何 if/return/循环判据**，
+# 不碰 self.stage、_fric、win、idle、keys，也不调整任何 sleep。
+# 初始化/运行失败一律降级为空操作，绝不影响 bot 启动与现有控制路径。
+# 抓图是全局限频的（默认最多 2Hz，`RF4_SHADOW_SAMPLE_S` 可调）：
+# pull/wait/lift 这些高频循环共用同一个闸门，不会各自刷 PrintWindow。
+_shadow = {
+    "tried": False,
+    "obj": None,
+    "err": 0,
+    "next_t": 0.0,        # 全局闸门：下一次允许抓图的 monotonic 时刻
+    "sample_s": None,     # 惰性解析的采样间隔（秒）
+}
+
+
+def _shadow_observer():
+    """惰性构造 ShadowObserver；失败只打一次 warn，之后返回 None。"""
+    if _shadow["tried"]:
+        return _shadow["obj"]
+    _shadow["tried"] = True
+    try:
+        import autofish_shadow
+        _shadow["obj"] = autofish_shadow.ShadowObserver()
+    except BaseException as e:                 # noqa: BLE001 - 不许阻断启动
+        print(f"[STATE][warn] shadow 初始化失败，已关闭: {e}", flush=True)
+        _shadow["obj"] = None
+    return _shadow["obj"]
+
+
+def _shadow_interval():
+    """采样最小间隔（秒）：惰性解析一次 `RF4_SHADOW_SAMPLE_S`，失败用 0.5。"""
+    if _shadow["sample_s"] is None:
+        try:
+            import autofish_shadow
+            _shadow["sample_s"] = autofish_shadow.sample_interval_from_env()
+        except BaseException:                  # noqa: BLE001 - 解析失败用默认值
+            _shadow["sample_s"] = 0.5
+    return _shadow["sample_s"]
+
+
+def _shadow_observe(source, force=False):
+    """只读观测：全局最多 2Hz 抓**一次**图 -> 交给 shadow 状态机。
+
+    - 限频判断在抓图**之前**：没到点直接返回 None，连 PrintWindow 都不调；
+    - 闸门是全局的（不区分 source），防止 pull/lift 边界短时间连抓；
+    - 只要放行就推进闸门，抓图失败也照样推进，避免故障时刷爆 PrintWindow；
+    - `force=True` 只给 cast/settle 的前后对照片用，语义上必须采到。
+
+    整个函数是独立的观测语句：返回值不得进入任何控制判断。
+    """
+    try:
+        observer = _shadow_observer()
+        if observer is None or not observer.enabled:
+            return None
+        now = time.monotonic()
+        if not force and now < _shadow["next_t"]:
+            return None
+        _shadow["next_t"] = now + _shadow_interval()   # 放行即计时，失败也算
+        img, _pos = capture_game()             # 一次放行只抓这一帧
+        try:
+            foreground = (ctypes.windll.user32.GetForegroundWindow()
+                          == game_hwnd())
+        except BaseException:                  # noqa: BLE001
+            foreground = False
+        return observer.update(img, foreground=foreground, source=source)
+    except BaseException as e:                 # noqa: BLE001 - 观测失败必须吞掉
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        _shadow["err"] += 1
+        if _shadow["err"] <= 3:
+            print(f"[STATE][warn] shadow 观测失败（第 {_shadow['err']} 次）: {e}",
+                  flush=True)
+        return None
+
+
 def screen(force=False):
     """虚拟桌面截图：真实截图打底，游戏区域用 PrintWindow 覆盖（带缓存）。"""
     now = time.time()
@@ -401,6 +476,8 @@ def patch_bottom_mode_held():
                                     hud_lost_since = None
                             except Exception:
                                 pass
+                            # shadow：全局最多 2Hz（限频在 _shadow_observe 内，只读）
+                            _shadow_observe("wait_bite")
                             sleep(0.4)
                             waited += 0.4
 
@@ -738,6 +815,7 @@ def patch_cast(pdi):
     from rf4s.component.tackle import StageId, Tackle
 
     def cast(self, lock):
+        _shadow_observe("cast_before", force=True)   # shadow：抛竿前一眼（强制采样）
         release_lift()                     # 抛竿前把抬竿松开
         # 重置"收线 45 秒"的计时：每一竿都从零开始算，否则会继承上一轮的旧截止时间
         try:
@@ -782,6 +860,7 @@ def patch_cast(pdi):
         pdi.keyUp("f5")
         print(f"[patch] 抛竿完成（Shift+左键 {CAST_HOLD}s，等 {CAST_LAND_DELAY}s，"
               f"短按关线杯）", flush=True)
+        _shadow_observe("cast_after", force=True)    # shadow：抛竿后一眼（强制采样）
 
     Tackle.cast = cast
     print("[patch] 抛竿：Shift+左键 1s -> 等 2.5s -> 短按关线杯（不做 diff 校验）")
@@ -929,7 +1008,8 @@ def patch_tackle_ready_timeout(seconds=TACKLE_READY_TIMEOUT):
 
 PULL_TIMEOUT = 120.0
 PULL_IDLE_SECS = 15.0
-LIFT_STUCK_GRACE = 8.0   # 线已收到>=90%后再拉这么多秒不结算，就套抄网（玩家 15:54 口径）   # 力度条连续无色多久才算搏鱼结束（原来实际只有 2 秒）
+LIFT_STUCK_GRACE = 8.0
+LIFT_NET_RETRY = 15.0     # 每次抄网后的冷静期：掏出动画+持网走近+兜鱼（16:35 玩家口径）   # 线已收到>=90%后再拉这么多秒不结算，就套抄网（玩家 15:54 口径）   # 力度条连续无色多久才算搏鱼结束（原来实际只有 2 秒）
 RETRIEVAL_FINISH_STREAK = 6   # 连续匹配次数才认定"收线完成"
 
 # ====================== 抬竿（右键 -> F6，全程按住）=======================
@@ -1214,6 +1294,8 @@ def patch_pull_continuous(timeout=PULL_TIMEOUT):
                     print(f"[FLOW] pull 退出：超时 {timeout:.0f}s", flush=True)
                     return
 
+                # shadow：全局最多 2Hz（限频在 _shadow_observe 内，只读，返回值无人使用）
+                _shadow_observe("pull")
                 sleep(FRICTION_SAMPLE)
                 # 底钓不需要 coffee / gear ratio 检查：
                 # 它们会在循环里反复抛异常被 error_handler 吞掉，导致 pull 被反复重入。
@@ -1288,6 +1370,7 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
             _over = False
             _near_since = None      # 圆环首次 >=90% 的时刻（临岸阶段开始）
             _net_tried = 0          # 抄网已尝试次数
+            _unknown_logged = 0     # "圆环读不出来"的日志只打前 3 次，免得刷屏
             while True:
                 if self.detection.is_fish_captured():
                     captured = True
@@ -1336,8 +1419,16 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                     ring = line_ring_ratio()
                 except Exception:
                     ring = -1.0
-                if ring >= 0 and ring < LINE_RING_NEAR:
-                    # 线还在半路：任何计时都不适用，继续拉
+                # ⚠️ ring < 0 = 圆环这次**读不出来**（HUD 没画/被遮挡），
+                # 绝不能当成"已收回"！2026-11-04 16:47 事故：-1 掉进 else 分支
+                # 被当作临岸，连套 3 次抄网后 break 松手，线只收到 75% 就停了。
+                # 读不出来时按"线还在半路"处理——继续拉，不套网。
+                if ring < LINE_RING_NEAR:
+                    if ring < 0 and _unknown_logged < 3:
+                        print("[patch] 线长圆环读不出来（HUD 未绘制），按'线在半路'继续拉",
+                              flush=True)
+                        _unknown_logged += 1
+                    # 线还在半路 / 读不出来：任何计时都不适用，继续拉
                     _over = False
                     _near_since = None
                 else:
@@ -1352,15 +1443,28 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                         import pydirectinput as _pdi
                         _pdi.FAILSAFE = False
                         focus_game_quiet()
-                        _pdi.press("pagedown")       # 掏/收抄网
-                        sleep(1.5)
-                        _pdi.press("pagedown")       # 再按一次确保掏出
-                        _near_since = time.time()     # 重计，给抄网后的收尾留时间
+                        # ⚠️ 必须先松左键(F5)：游戏规则是"手持抄网时不能收线"，
+                        # 左键按着 = 一直处于收线姿态 = 抄网掏不出来（16:15 实测）。
+                        # 右键(F6 抬竿)保持按住——玩家口径：抄网时也要提着竿。
+                        _pdi.keyUp("f5")
+                        print("[patch] 已松左键（收线）保持右键（提竿）", flush=True)
+                        sleep(0.4)
+                        _pdi.press("pagedown")       # 掏抄网
+                        sleep(1.2)                   # 等掏出动画
+                        _near_since = time.time() + LIFT_NET_RETRY   # 冷静期：掏出+走过去+兜
                         _net_tried += 1
-                        if _net_tried >= 3:
-                            print("[patch] 抄网已试 3 次仍未结算，停手等人工",
-                                  flush=True)
-                            break
+                        # 左键重新按住（若结算了，_both_down 幂等无碍；
+                        # 若没结算，继续收线姿态等下一轮判断）
+                        _pdi.keyDown("f5")
+                        if _net_tried >= 2:
+                            # 玩家口径：线没收回来就一直拉。抄网失败也不撒手，
+                            # 只是不再反复套网——继续按住等鱼自己进网/结算。
+                            print("[patch] 抄网已试 2 次，继续按住等结算"
+                                  "（不撒手）", flush=True)
+                            _net_tried = 0          # 归零，30 秒后再试一轮
+                            _near_since = time.time() + 30.0
+                # shadow：全局最多 2Hz（限频在 _shadow_observe 内，只读，返回值无人使用）
+                _shadow_observe("lift")
                 sleep(LIFT_POLL)
         finally:
             _both_up(self)
@@ -1799,6 +1903,37 @@ def quick_relog() -> None:
     print("[patch] 已小退到登录界面，请重新登录", flush=True)
 
 
+def patch_disable_clicklock():
+    """关闭 Windows「单击锁定」(ClickLock) 辅助功能，退出时恢复原状。
+
+    玩家系统开启了 ClickLock（触发时长 2200ms）：按住鼠标约 2.2 秒后
+    Windows 会代为"锁定按住"，再点一下才解除。脚本按住 F5(收线) 经常超过
+    2.2 秒——一旦锁定，脚本 keyUp 后系统仍认为按着，掏抄网（要求松开收线）
+    就永远掏不出来（2026-11-04 16:15 实测事故的可能原因之一）。
+    """
+    import ctypes
+
+    u = ctypes.windll.user32
+    SPI_GETMOUSECLICKLOCK = 0x101E
+    SPI_SETMOUSECLICKLOCK = 0x101F
+    state = ctypes.wintypes.BOOL()
+    if not u.SystemParametersInfoW(SPI_GETMOUSECLICKLOCK, 0,
+                                   ctypes.byref(state), 0):
+        print("[patch][warn] ClickLock 状态读取失败，跳过", flush=True)
+        return
+    if not state.value:
+        print("[patch] ClickLock（单击锁定）本就关闭", flush=True)
+        return
+
+    import atexit
+
+    u.SystemParametersInfoW(SPI_SETMOUSECLICKLOCK, 0,
+                            ctypes.c_void_p(0), 0x03)   # 关闭 + 广播 WM_SETTINGCHANGE
+    atexit.register(lambda: u.SystemParametersInfoW(
+        SPI_SETMOUSECLICKLOCK, 0, ctypes.c_void_p(1), 0x03))
+    print("[patch] 已临时关闭 ClickLock（单击锁定），脚本退出时恢复", flush=True)
+
+
 def patch_reject_friction_brake():
     """A5（review）：上游 FrictionBrake 子进程会独立滚轮（绕过记账），
     和适配层的摩擦片控制互相残杀。检测到就拒绝启动。"""
@@ -1900,6 +2035,7 @@ def patch_handle_fish_click():
             return
         logger.info("Handling fish (click keep)")
         sleep(0.5)                                  # 等结算框淡入
+        _shadow_observe("settle_before", force=True)   # shadow：入护前一眼（强制采样）
         with self.hold_keys(mouse=False, shift=False):
             self._handle_fish()
             if self.cfg.PROFILE.MODE in ["bottom", "pirk", "elevator"]:
@@ -1908,6 +2044,7 @@ def patch_handle_fish_click():
             limit = self.cfg.BOT.KEEPNET.CAPACITY - self.cfg.ARGS.FISHES_IN_KEEPNET
             if self.result.kept >= limit:
                 on_keepnet_full(self)
+        _shadow_observe("settle_after", force=True)    # shadow：入护后一眼（强制采样）
 
     def _handle_fish(self) -> None:
         self.result.total += 1
@@ -2161,6 +2298,7 @@ def main():
     patch_fish_captured()
     patch_handle_fish_click()
     patch_reject_friction_brake()
+    patch_disable_clicklock()
     patch_key_watch()
     patch_single_rod(pag, pdi)
     patch_bottom_mode_held()
