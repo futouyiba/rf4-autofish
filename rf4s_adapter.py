@@ -825,8 +825,6 @@ def patch_retrieval_timeout(seconds=RETRIEVAL_TIMEOUT):
         """
         _start.clear()
 
-    is_retrieval_finished.reset_deadline = reset_deadline
-
     def is_retrieval_finished(self):
         key = id(self)
         t0 = _start.get(key)
@@ -845,8 +843,9 @@ def patch_retrieval_timeout(seconds=RETRIEVAL_TIMEOUT):
             return True
         return False
 
+    is_retrieval_finished.reset_deadline = reset_deadline   # pull 入口会调用它清残留
     Detection.is_retrieval_finished = is_retrieval_finished
-    print(f"[patch] 收线判定加 {seconds:.0f}s 超时兜底")
+    print(f"[patch] 收线判定加 {seconds:.0f}s 超时兜底（pull 入口自动清残留）")
 
 
 TACKLE_READY_TIMEOUT = 6.0   # 秒；等价判据失效时的兜底，别设太大（每轮都要等它）
@@ -1285,7 +1284,8 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
         lost = 0
         captured = False
         try:
-            while time.time() - t0 < timeout:
+            _over = False
+            while True:
                 if self.detection.is_fish_captured():
                     captured = True
                     break
@@ -1301,16 +1301,37 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                 if icon or lvl > 0:                     # 任一信号在 = 鱼还在
                     confirmed = True
                     lost = 0
+                    if _over:
+                        # 超时窗口已过但鱼还挂着（拉到一半/正在出线）——绝不撒手。
+                        # 2026-11-04 15:48 事故：30s 超时一到就松手，鱼又把线拉出去
+                        # 200 米。改成：鱼在就一直拉，只打印一次提醒。
+                        if time.time() - _first_over_log > 10:
+                            print(f"[patch] 拉鱼超时 {time.time()-t0:.0f}s 但鱼还挂着"
+                                  f"（icon={icon} lvl={lvl}），继续按住不撒手",
+                                  flush=True)
+                            _first_over_log = time.time()
                 elif confirmed:
                     # 图标熄灭且无张力，连续 2 秒才认为脱钩（单帧误判不算）
                     lost += 1
                     if lost >= LIFT_LOST_LIMIT:
                         print("[patch] 图标熄灭且无拉力，鱼已脱钩", flush=True)
                         break
+                    if _over and lost == 1:
+                        print("[patch] 超时后鱼信号消失，等满 2s 防抖确认脱钩",
+                              flush=True)
                 elif time.time() - t0 > LIFT_PROBE:
                     # 只有"进来时就没鱼"才走这条快速放弃
                     print("[patch] 图标不亮、也无拉力，判定无鱼", flush=True)
                     break
+                # 硬上限：3 分钟。真到这地步说明彻底拉不动，再往上没意义
+                if time.time() - t0 > 180.0:
+                    print("[patch] 拉鱼超过 180s 硬上限，停手等人工", flush=True)
+                    break
+                if not _over and time.time() - t0 >= timeout:
+                    _over = True
+                    _first_over_log = time.time()
+                    print(f"[patch] 拉鱼 {timeout:.0f}s 未结算，鱼若还挂着将继续拉"
+                          f"（不撒手）", flush=True)
                 sleep(LIFT_POLL)
         finally:
             _both_up(self)
