@@ -35,14 +35,17 @@ import numpy as np
 
 ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
-# ---- RF4S 源码位置（第三方项目，未随本仓库分发，见 README 的"准备"一节）----
-# 默认取 <本文件目录>/refs/RussianFishing4Script，也可用环境变量 RF4S_REF 指定
+# ---- RF4S 源码位置（第三方项目快照在 vendor/，也可用环境变量 RF4S_REF 指定）----
 REF_DIR = Path(os.environ.get("RF4S_REF",
                               Path(__file__).resolve().parent / "refs" / "RussianFishing4Script"))
 if not REF_DIR.exists():
+    alt = Path(__file__).resolve().parent / "vendor"
+    if (alt / "rf4s").exists():
+        REF_DIR = alt
+if not REF_DIR.exists():
     raise SystemExit(f"[patch] 找不到 RF4S 源码目录: {REF_DIR}\n"
-                     f"       请先 clone RussianFishing4Script 到该路径，"
-                     f"或设置环境变量 RF4S_REF")
+                     f"       请 clone RussianFishing4Script 到 refs/，或设置 RF4S_REF，"
+                     f"或使用仓库内置的 vendor/ 目录")
 sys.path.insert(0, str(REF_DIR))
 os.chdir(REF_DIR)
 
@@ -566,9 +569,10 @@ def friction_nudge(delta: int) -> None:
 def _tier(lvl: int) -> int:
     """四色分类 -> 玩家的三档口径（2026-11-04 02:41）：
 
-      1 档 = 力度最低的颜色（绿/黄，实测 hue 23~35）→ 一直 1 档就升
-      2 档 = 橙（hue 11~22）→ 目标，稳住不动
-      3 档 = 红（hue ≤10 或 ≥170）→ 立刻降
+      1 档 = 力度最低的颜色（黄绿，实测 hue=33, RGB(200,214,63)）→ 一直 1 档就升
+      2 档 = 金黄偏橙/琥珀（实测 hue=25, RGB(229,188,0)）→ 目标，稳住不动
+      3 档 = 红（实测 hue=6）→ 立刻降
+    阈值 2026-11-04 12:49 由玩家指认截图标定：橙/黄绿分界=29（25 与 33 的中点）。
     分类器 0（空载/松线瞬间）按 1 档对待——松线不该阻止升档判断。
     """
     if lvl >= 4:
@@ -683,6 +687,12 @@ def patch_cast(pdi):
 
     def cast(self, lock):
         release_lift()                     # 抛竿前把抬竿松开
+        # 重置"收线 45 秒"的计时：每一竿都从零开始算，否则会继承上一轮的旧截止时间
+        try:
+            from rf4s.controller.detection import Detection
+            Detection.is_retrieval_finished.reset_deadline()
+        except Exception:
+            pass
         time.sleep(0.15)
         maybe_dismiss("抛竿前")            # 卡牌/技能/升级弹窗会吃掉 Shift+F5
         friction_absolute(FRICTION_INITIAL)   # 每竿前都校准（线上无鱼，安全）
@@ -754,6 +764,16 @@ def patch_retrieval_timeout(seconds=RETRIEVAL_TIMEOUT):
 
     orig = Detection.is_retrieval_finished
     _start: dict[int, float] = {}
+
+    def reset_deadline() -> None:
+        """每次抛竿开始时清掉计时（否则会继承上一轮的旧截止时间）。
+
+        实测症状：刚咬钩 3 秒就报"收线超过 45s 仍未判定完成" —— 因为计时器
+        从上一轮第一次调用起算，那条鱼收完后没人清，一直挂在那里。
+        """
+        _start.clear()
+
+    is_retrieval_finished.reset_deadline = reset_deadline
 
     def is_retrieval_finished(self):
         key = id(self)
@@ -1870,14 +1890,19 @@ def friction_bar_state():
     hue = int(np.median(hh[:, best[1] - n_lead + 1:best[1] + 1][lead]))
     sat = int(np.median(ss[:, best[1] - n_lead + 1:best[1] + 1][lead]))
 
+    # 分档阈值（2026-11-04 12:49 用玩家指认的截图标定）：
+    #   1 档（力最小）实测 hue=33 RGB(200,214,63) 黄绿——玩家指认
+    #   2 档（目标）  实测 hue=25 RGB(229,188,0) 金黄偏橙——玩家指认
+    #   3 档（红）    实测 hue=6  红
+    # 橙/黄绿分界取 25 与 33 的正中间 = 29（两侧各留 4° 余量）。
+    # ⚠️ 之前分界是 22，把 2 档的 25° 误判成 1 档——历史日志里 25° 出现 100 次
+    # 全被当成"力太小"继续升档，本该命中目标稳住的。
     if hue <= 10 or hue >= 170:
-        level = 4
-    elif hue <= 22:
-        level = 3
-    elif hue <= 35:
-        level = 2
+        level = 4                                  # 红 = 3 档
+    elif hue <= 29:
+        level = 3                                  # 橙/琥珀 = 2 档（目标）
     elif hue <= 85:
-        level = 1
+        level = 2                                  # 黄绿 = 1 档（力小）
     else:
         level = 0
 
