@@ -9,7 +9,7 @@
 
 卡住的时候不硬扛：把现场截图丢出来，等外部 Agent 给指令再继续。
 
-> ⚠️ 仅供个人学习与单机使用。本仓库**不包含**游戏本体、第三方 RF4S 源码，也不含任何账号 / 服务器信息。
+> ⚠️ 仅供个人学习与单机使用。本仓库**不包含**游戏本体与任何账号 / 服务器信息；上游 RF4S 源码以 `vendor/` 快照形式内置（GPL-3.0）。
 
 ---
 
@@ -136,17 +136,30 @@
 pip install pywin32 pillow numpy opencv-python pyautogui pydirectinput
 ```
 
-### 3. 第三方 RF4S（本仓库不分发）
+### 3. 第三方 RF4S 源码
+
+**推荐**：本仓库已内置快照（`vendor/`，v0.11.0 + 定制 config），直接软链或设环境变量即可：
+
+```bat
+rem Windows cmd（junction 不需要管理员）：
+mklink /J refs\RussianFishing4Script vendor
+rem 或者：
+set RF4S_REF=%CD%\vendor
+```
+
+也可以自行克隆上游（行为等价，只是要自己维护 config 定制）：
 
 ```bash
 git clone https://github.com/dereklee0310/RussianFishing4Script refs/RussianFishing4Script
 ```
 
-不想放在 `refs/` 也可以，用环境变量指定：
+用环境变量指定任意路径：
 
 ```bash
 set RF4S_REF=D:\path\to\RussianFishing4Script
 ```
+
+> `vendor/` 的内容、与上游的差异、许可证说明见 [vendor/VENDOR.md](vendor/VENDOR.md)。
 
 ---
 
@@ -252,4 +265,4 @@ python agentctl.py quit                  # 让它停手
 
 ## License
 
-MIT（仅限本仓库代码）。第三方 RF4S 遵循其自身许可，请勿把它的源码复制进来。
+外层适配层为 MIT；`vendor/` 内的上游 RF4S 快照遵循 **GPL-3.0**（见 `vendor/LICENSE`）。两套许可并存，分发时需一并携带。
