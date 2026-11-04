@@ -77,7 +77,7 @@
 | `patch_fish_hooked_bar` | **咬钩 = 底部圆形鱼图标出现** | 外环白色像素：有鱼 110~133，无鱼 0~22 |
 | `patch_fish_captured` | **结算框** = `keep.png` ≥0.95 且位置落在 (300,40)-(1500,620) | 鱼护 HUD 图标也会匹配到 0.82，会误判 |
 | `patch_tackle_ready_timeout` | 复位完成 = 无鱼图标 + 无结算框，连续 2 次 | 中文界面 `ready.png` 匹配不到，原本每轮白等 18 秒 |
-| `patch_retrieval_finished_debounce` | 收线完成要连续 6 次匹配 | `wheel.png` 在线杯停转时就会匹配，鱼一松力就误判收完 |
+| `patch_retrieval_finished_debounce` | 收线完成要连续 6 次匹配 | `wheel.png`（线杯图标，外圈就是线长圆环）**本身能匹配**，但鱼一松力线杯停转、图标回到静止形态就会误命中，所以要防抖 |
 | `patch_retrieval_timeout` | 45 秒强制兜底 | 同上，靠判据可能永远等不到 |
 
 ### 三、流程层（把动作顺序改成这个客户端要的样子）
@@ -139,7 +139,7 @@ pip install pywin32 pillow numpy opencv-python pyautogui pydirectinput
 ### 3. 第三方 RF4S（本仓库不分发）
 
 ```bash
-git clone https://github.com/<RussianFishing4Script 仓库> refs/RussianFishing4Script
+git clone https://github.com/dereklee0310/RussianFishing4Script refs/RussianFishing4Script
 ```
 
 不想放在 `refs/` 也可以，用环境变量指定：
@@ -246,7 +246,7 @@ python agentctl.py quit                  # 让它停手
 - 线长圆环 `<10%` 的区间还没有足够实测样本，阈值是保守估计
 - 结算框按钮位置靠"扫亮边边框"推断，UI 大改就失效
 - 摩擦片依赖滚轮，**滚轮是否真的送达游戏尚未验证**（档位没有屏幕读数可对账）
-- 中文客户端专用：`ready.png` / `wheel.png` 这些英文模板匹配不到，才走了等价判据
+- 中文客户端专用：`ready.png` 匹配不到（走了等价判据）；`wheel.png` 本身能匹配（它就是线杯图标），只是需要防抖
 
 ---
 
