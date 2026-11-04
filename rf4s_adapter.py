@@ -928,7 +928,8 @@ def patch_tackle_ready_timeout(seconds=TACKLE_READY_TIMEOUT):
 
 
 PULL_TIMEOUT = 120.0
-PULL_IDLE_SECS = 15.0   # 力度条连续无色多久才算搏鱼结束（原来实际只有 2 秒）
+PULL_IDLE_SECS = 15.0
+LIFT_STUCK_GRACE = 8.0   # 线已收到>=90%后再拉这么多秒不结算，就套抄网（玩家 15:54 口径）   # 力度条连续无色多久才算搏鱼结束（原来实际只有 2 秒）
 RETRIEVAL_FINISH_STREAK = 6   # 连续匹配次数才认定"收线完成"
 
 # ====================== 抬竿（右键 -> F6，全程按住）=======================
@@ -942,7 +943,7 @@ RETRIEVAL_FINISH_STREAK = 6   # 连续匹配次数才认定"收线完成"
 #
 # 所以：搏鱼全程按住抬竿（用户要求），收线结束后再单独走一次"抬竿上鱼"。
 LIFT_KEY = "f6"
-LIFT_TIMEOUT = 30.0     # 抬竿最长按住时间（超时放弃，交给主循环复位）
+LIFT_TIMEOUT = 30.0     # 已废弃：拉鱼不再有整体超时（玩家 15:54 口径），线没收回来就一直拉
 LIFT_PROBE = 4.0        # 抬这么久仍无拉力/结算 -> 认为本来就没鱼
 LIFT_POLL = 0.25
 LIFT_LOST_LIMIT = 8     # 拉力消失连续次数（约 2s）-> 认为鱼跑了
@@ -1285,6 +1286,8 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
         captured = False
         try:
             _over = False
+            _near_since = None      # 圆环首次 >=90% 的时刻（临岸阶段开始）
+            _net_tried = 0          # 抄网已尝试次数
             while True:
                 if self.detection.is_fish_captured():
                     captured = True
@@ -1323,15 +1326,41 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                     # 只有"进来时就没鱼"才走这条快速放弃
                     print("[patch] 图标不亮、也无拉力，判定无鱼", flush=True)
                     break
-                # 硬上限：3 分钟。真到这地步说明彻底拉不动，再往上没意义
-                if time.time() - t0 > 180.0:
-                    print("[patch] 拉鱼超过 180s 硬上限，停手等人工", flush=True)
-                    break
-                if not _over and time.time() - t0 >= timeout:
-                    _over = True
-                    _first_over_log = time.time()
-                    print(f"[patch] 拉鱼 {timeout:.0f}s 未结算，鱼若还挂着将继续拉"
-                          f"（不撒手）", flush=True)
+                # ---- 玩家 2026-11-04 15:54 定稿的拉鱼规则 ----
+                # 线还没收回来（圆环 <90%）：**无限期拉**，没有 30 秒这回事，
+                # 也没有"拉不动"的判断——线在路上就一直拉。
+                # 圆环 >=90%（线基本收回）却拉不上来：此时才考虑套抄网——
+                # 先继续拉 STUCK_GRACE 秒给鱼游到岸边的余地，还不结算就
+                # 掏抄网（PageDown），掏完继续拉等结算。
+                try:
+                    ring = line_ring_ratio()
+                except Exception:
+                    ring = -1.0
+                if ring >= 0 and ring < LINE_RING_NEAR:
+                    # 线还在半路：任何计时都不适用，继续拉
+                    _over = False
+                    _near_since = None
+                else:
+                    if _near_since is None:
+                        _near_since = time.time()
+                        print(f"[patch] 线已收到 {ring:.0%}，进入'临岸'阶段"
+                              f"（再拉 {LIFT_STUCK_GRACE:.0f}s 不结算就套抄网）",
+                              flush=True)
+                    elif time.time() - _near_since >= LIFT_STUCK_GRACE:
+                        print("[patch] 线收回了但拉不上来，套抄网（PageDown）",
+                              flush=True)
+                        import pydirectinput as _pdi
+                        _pdi.FAILSAFE = False
+                        focus_game_quiet()
+                        _pdi.press("pagedown")       # 掏/收抄网
+                        sleep(1.5)
+                        _pdi.press("pagedown")       # 再按一次确保掏出
+                        _near_since = time.time()     # 重计，给抄网后的收尾留时间
+                        _net_tried += 1
+                        if _net_tried >= 3:
+                            print("[patch] 抄网已试 3 次仍未结算，停手等人工",
+                                  flush=True)
+                            break
                 sleep(LIFT_POLL)
         finally:
             _both_up(self)
