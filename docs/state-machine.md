@@ -207,6 +207,17 @@ MVP 的安全策略：
   - 今天的一个隐患：`S7` 拉鱼阶段控制器还在跑，档位会被无意义地调
 - `S0_UNKNOWN` 时控制器停摆，且 `calibrated` 置 False
 
+## 8.1 当前实施进度（2026-11-04 17:55）
+
+阶段 1 的纯观测与 shadow 状态推断已完成，**尚未接入运行主流程**，因此不会改变钓鱼行为：
+
+- `autofish_observation.py`：同一帧提取鱼图标、力度条、线长圆环、结算框、确定弹窗和 HUD；不可读统一为 `None/UNKNOWN`
+- `autofish_state.py`：纯状态候选 + 连续帧防抖（FIGHT 2 帧、LAND 3 帧、UNKNOWN 5 帧等）
+- `tests/test_observation.py` / `tests/test_state_shadow.py`：54 个合成图与逻辑测试
+- 两个模块源码均没有截图、焦点或键鼠输入入口；`rf4s_adapter.py` 未接入、未修改
+
+主 Agent 审查后额外补了：`Observation.evidence` 深冻结快照，以及 pending 状态不虚增 `stable_frames`。
+
 ## 9. 实施顺序（复审后修订）
 
 原计划把"状态机"、"按键 reconcile"、"计时器清理"拆得太开，会产生一个危险的中间版本：新状态机和旧 `hold_keys/_both_down/抄网代码` 同时拥有 F5/F6。修订为：
