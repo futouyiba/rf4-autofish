@@ -188,8 +188,30 @@ class TestShadowObserverLogging(unittest.TestCase):
         line = lines[-1]
         for token in ("stable=fight", "cand=fight", "conf=", "fish=true",
                       "bar=3/2", "ring=0.87", "source=wait_bite",
-                      "reason="):
+                      "ctx=wait_bite", "reason="):
             self.assertIn(token, line, line)
+
+    def test_source_is_passed_to_tracker_and_logged(self):
+        """source 不是日志装饰：它决定候选，且必须同时出现在日志与 evidence。"""
+        obs, lines, _ = self._observer(Feed(mk(captured=T.TRUE, hud=T.UNKNOWN)))
+
+        est = obs.update(object(), foreground=True, source="settle_before")
+        self.assertEqual(est.evidence["context"], "settle_before")
+        self.assertEqual(est.evidence["source"], "settle_before")
+        self.assertEqual(est.evidence["pending"]["state"], "settle")
+        self.assertIn("source=settle_before", lines[-1])
+        self.assertIn("ctx=settle_before", lines[-1])
+
+        est = obs.update(object(), foreground=True, source="settle_before")
+        self.assertEqual(est.state.value, "settle")
+        self.assertIn("stable=settle", lines[-1])
+
+    def test_wait_bite_source_does_not_let_captured_settle(self):
+        obs, lines, _ = self._observer(Feed(mk(captured=T.TRUE, hud=T.UNKNOWN)))
+        for _ in range(6):
+            est = obs.update(object(), foreground=True, source="wait_bite")
+        self.assertNotEqual(est.state.value, "settle", est.reason)
+        self.assertTrue(any("ctx=wait_bite" in line for line in lines), lines)
 
     def test_disabled_returns_none_and_never_reads_frame(self):
         lines = []

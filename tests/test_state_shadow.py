@@ -49,10 +49,10 @@ def mk(
     )
 
 
-def feed(tracker, n, **kw):
+def feed(tracker, n, context="", **kw):
     est = None
     for _ in range(n):
-        est = tracker.update(mk(**kw))
+        est = tracker.update(mk(**kw), context=context)
     return est
 
 
@@ -61,11 +61,12 @@ class TestClassifyCandidate(unittest.TestCase):
         cand, reason = astate.classify_candidate(
             mk(ok_modal=T.TRUE, captured=T.TRUE, fish=T.TRUE, ring=0.99))
         self.assertIs(cand, S.MODAL)
-        self.assertEqual(reason, "ok_modal_true")
+        self.assertIn("ok_modal_true", reason)
 
     def test_settle_wins_over_fish(self):
         cand, _ = astate.classify_candidate(
-            mk(captured=T.TRUE, fish=T.TRUE, ring=0.99))
+            mk(captured=T.TRUE, fish=T.TRUE, ring=0.99),
+            context="settle_before")
         self.assertIs(cand, S.SETTLE)
 
     def test_ring_none_is_fight_never_land(self):
@@ -120,11 +121,14 @@ class TestDebounce(unittest.TestCase):
         self.assertIs(est.state, S.FIGHT)
         self.assertIsNot(est.state, S.LAND)
 
-    def test_bar_tier2_without_fish_is_fight(self):
+    def test_bar_tier2_without_fish_is_fight_only_in_active_context(self):
+        """力度条单独成 FIGHT 只在搏鱼动作上下文；等口/抛竿不成立。"""
         t = astate.ShadowStateTracker()
-        est = feed(t, 2, fish=T.FALSE, bar_level=3, bar_tier=2, ring=None)
+        est = feed(t, 2, context="pull",
+                   fish=T.FALSE, bar_level=3, bar_tier=2, ring=None)
         self.assertIs(est.state, S.FIGHT)
         self.assertEqual(est.evidence["candidate"], "fight")
+        self.assertEqual(est.evidence["context"], "pull")
 
     def test_idle_bar_with_hud_is_wait_bite(self):
         t = astate.ShadowStateTracker()
@@ -149,10 +153,12 @@ class TestDebounce(unittest.TestCase):
 
     def test_captured_single_frame_holds_then_two_frames_interrupt(self):
         t = astate.ShadowStateTracker()
-        feed(t, 2, fish=T.TRUE)
-        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN))
+        feed(t, 2, context="pull", fish=T.TRUE)
+        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN),
+                       context="settle_before")
         self.assertIs(est.state, S.FIGHT)
-        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN))
+        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN),
+                       context="settle_before")
         self.assertIs(est.state, S.SETTLE)
         self.assertTrue(est.changed)
         # 几何判据证据少 -> 置信度必须打折
@@ -227,6 +233,110 @@ class TestDebounce(unittest.TestCase):
         est = feed(t, 50, fish=T.TRUE)
         self.assertIs(est.state, S.FIGHT)
         self.assertLessEqual(est.confidence, 1.0)
+
+
+class TestRealLogRegressions(unittest.TestCase):
+    """2026-11-04 真实 shadow 日志的三类误判，逐条钉死。"""
+
+    def test_wait_bite_bar_tier_and_full_ring_is_not_land(self):
+        """日志 A：wait_bite fish=false bar=2/1 ring=0.95 -> 曾判 LAND。"""
+        o = mk(fish=T.FALSE, bar_level=3, bar_tier=2, ring=0.95)
+        cand, reason = astate.classify_candidate(o, context="wait_bite")
+        self.assertIs(cand, S.WAIT_BITE)
+        self.assertNotIn(cand, (S.LAND, S.FIGHT))
+        self.assertIn("bar_tier_2_ignored", reason)
+
+        t = astate.ShadowStateTracker()
+        est = feed(t, 3, context="wait_bite",
+                   fish=T.FALSE, bar_level=3, bar_tier=2, ring=0.95)
+        self.assertIs(est.state, S.WAIT_BITE)
+        self.assertLessEqual(est.confidence, 0.55)
+
+    def test_pull_fish_with_ok_border_is_fight_or_land_not_modal(self):
+        """日志 B：pull fish=true bar=2/1 ring=0.95 ok_modal_true -> 曾判 MODAL。"""
+        for ring, expected in ((None, S.FIGHT), (0.42, S.FIGHT), (0.95, S.LAND)):
+            with self.subTest(ring=ring):
+                cand, reason = astate.classify_candidate(
+                    mk(fish=T.TRUE, bar_level=3, bar_tier=2, ring=ring,
+                       ok_modal=T.TRUE),
+                    context="pull")
+                self.assertIs(cand, expected, reason)
+                self.assertIsNot(cand, S.MODAL)
+
+        t = astate.ShadowStateTracker()
+        est = feed(t, 2, context="pull", fish=T.TRUE, bar_level=3,
+                   bar_tier=2, ring=0.42, ok_modal=T.TRUE)
+        self.assertIs(est.state, S.FIGHT)
+
+    def test_pull_ok_border_without_fight_evidence_is_not_modal(self):
+        """pull 中的 OK 边框一律上下文抑制（MVP 直接屏蔽）。"""
+        cand, reason = astate.classify_candidate(
+            mk(fish=T.FALSE, ok_modal=T.TRUE), context="lift")
+        self.assertIs(cand, S.UNKNOWN)
+        self.assertIn("ok_modal_suppressed", reason)
+
+    def test_wait_bite_and_cast_captured_geometry_never_settles(self):
+        """日志 C：wait_bite/cast_after 连续 20 帧 captured=true 不得进 SETTLE。"""
+        for ctx in ("wait_bite", "cast_before", "cast_after"):
+            with self.subTest(context=ctx):
+                t = astate.ShadowStateTracker()
+                est = feed(t, 20, context=ctx, captured=T.TRUE,
+                           hud=T.TRUE, ring=0.42)
+                self.assertIsNot(est.state, S.SETTLE, est.reason)
+                self.assertEqual(est.evidence["candidate"], "wait_bite")
+
+        # 读不到圆环时也只是 UNKNOWN，绝不凭 captured 强判。
+        t = astate.ShadowStateTracker()
+        est = feed(t, 20, context="cast_after", captured=T.TRUE,
+                   hud=T.UNKNOWN)
+        self.assertIsNot(est.state, S.SETTLE)
+        self.assertIs(est.state, S.UNKNOWN)
+
+    def test_settle_context_two_frames_confirms(self):
+        t = astate.ShadowStateTracker()
+        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN),
+                       context="settle_before")
+        self.assertIs(est.state, S.UNKNOWN)
+        self.assertEqual(est.evidence["pending"]["state"], "settle")
+        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN),
+                       context="settle_before")
+        self.assertIs(est.state, S.SETTLE)
+        self.assertTrue(est.changed)
+        self.assertEqual(est.evidence["context"], "settle_before")
+
+    def test_capture_transition_after_fight_allows_settle(self):
+        """FIGHT 稳定后 source 仍为 pull 时，捕捉到结算按钮 -> 允许 SETTLE。"""
+        t = astate.ShadowStateTracker()
+        feed(t, 2, context="pull", fish=T.TRUE)
+        self.assertIs(t.state, S.FIGHT)
+
+        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN), context="pull")
+        self.assertIs(est.state, S.FIGHT)
+        self.assertEqual(est.evidence["pending"]["state"], "settle")
+        self.assertIn("capture_transition", est.evidence["candidate_reason"])
+
+        est = t.update(mk(captured=T.TRUE, hud=T.UNKNOWN), context="pull")
+        self.assertIs(est.state, S.SETTLE)
+        self.assertTrue(est.changed)
+
+    def test_capture_transition_expires_after_leaving_fight(self):
+        t = astate.ShadowStateTracker()
+        feed(t, 2, context="pull", fish=T.TRUE)          # FIGHT
+        feed(t, 10, context="wait_bite", fish=T.FALSE, ring=0.40)  # 离开过渡窗口
+        self.assertIs(t.state, S.WAIT_BITE)
+        est = feed(t, 2, context="pull", captured=T.TRUE, hud=T.UNKNOWN)
+        self.assertIsNot(est.state, S.SETTLE)
+
+    def test_source_and_context_are_in_evidence(self):
+        t = astate.ShadowStateTracker()
+        est = t.update(mk(fish=T.TRUE), context="pull")
+        self.assertEqual(est.evidence["source"], "pull")
+        self.assertEqual(est.evidence["context"], "pull")
+
+        # 未知 source 归一化为 ""，但原文仍保留在 evidence 供复盘。
+        est = t.update(mk(fish=T.TRUE), context="mystery_stage")
+        self.assertEqual(est.evidence["context"], "")
+        self.assertEqual(est.evidence["source"], "mystery_stage")
 
 
 class TestNoInputSurface(unittest.TestCase):

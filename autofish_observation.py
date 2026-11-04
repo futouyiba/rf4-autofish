@@ -186,6 +186,18 @@ LINE_RING_STEP_DEG = 3
 OK_BTN_BOX = (871, 793, 1048, 826)   # x0, y0, x1, y1
 OK_BTN_BRIGHT = 150
 OK_BTN_FRAC = 0.85
+# 2026-11-04 真实日志：搏鱼 HUD/夜雾高光也会在按钮框的两个横向上画出
+# 连续亮行（`_hud_now.png` top=1.00 bot=0.96），只看上下两行必然假阳性。
+# 追加三条结构判据（与真实 `_modal.png` / `_after_ok*.png` 离线标定）：
+#   * 左右竖边框：按钮是闭合矩形，竖边也必须亮；
+#   * 按钮外部（框上下各 12 行）必须比边框暗 —— 弹窗底色 V≈60，
+#     夜雾/水面高光的外侧 V≈160~172；
+#   * 边框与外侧的亮度差 >= 60，防止"整片亮区里恰好有两条亮线"。
+# 阈值取自本地已有截图，未抓新图；真实回归见 tests/test_observation.py。
+OK_BTN_SURROUND_ROWS = 12
+OK_BTN_SURROUND_MAX = 110.0          # 框外均值上限（弹窗≈60，雾面≈170）
+OK_BTN_CONTRAST_MIN = 60.0           # 边框均值 - 框外均值（弹窗≈190，雾面≈0）
+OK_BTN_EDGE_FRAC = 0.60              # 左右竖边框至少一侧的亮像素占比
 
 # ---- 渔获结算：底部「入护 [Space]」「释放 [Backspace]」按钮 ----
 # 适配器用 keep.png 模板匹配（0.95）+ 位置框；本模块不依赖模板文件，
@@ -486,25 +498,76 @@ def _ring(arr: np.ndarray) -> tuple[float | None, dict]:
 
 
 def _ok_modal(arr: np.ndarray) -> tuple[TriState, dict]:
+    """「确定」按钮：上下 + 左右边框 + 框内外亮度对比。
+
+    只看上下两条亮行会在搏鱼 HUD / 夜雾高光上假阳性（2026-11-04 真实日志）。
+    真实按钮是一个闭合矩形：上下边框亮、左右竖边也亮，且按钮外面是深色
+    弹窗底板（V≈60）；夜雾/水面高光的外侧同样是亮的（V≈160+），由
+    `OK_BTN_SURROUND_MAX` 与 `OK_BTN_CONTRAST_MIN` 一并拒掉。
+
+    ⚠️ 仍然只是"这一帧看起来有确定按钮"；连续帧防抖在状态机里做。
+    """
     x0, y0, x1, y1 = OK_BTN_BOX
     ev = {
         "box": [x0, y0, x1, y1],
         "bright_min": OK_BTN_BRIGHT,
         "frac_min": OK_BTN_FRAC,
+        "edge_frac_min": OK_BTN_EDGE_FRAC,
+        "surround_rows": OK_BTN_SURROUND_ROWS,
+        "surround_max": OK_BTN_SURROUND_MAX,
+        "contrast_min": OK_BTN_CONTRAST_MIN,
     }
     if not _size_ok(arr):
         ev["reason"] = "non_reference_frame"
         return TriState.UNKNOWN, ev
 
-    band = _gray(arr[y0:y1 + 1, x0:x1])
-    top_frac = float((band[0] >= OK_BTN_BRIGHT).mean())
-    bot_frac = float((band[-1] >= OK_BTN_BRIGHT).mean())
-    ev["top_frac"] = round(top_frac, 3)
-    ev["bottom_frac"] = round(bot_frac, 3)
+    gray = _gray(arr)
+    # 含 x1 这一列：实测右竖边框正好落在 x1-1..x1，旧切片漏掉了最右一列。
+    box = gray[y0:y1 + 1, x0:x1 + 1]
+    bright = box >= OK_BTN_BRIGHT
 
-    hit = top_frac > OK_BTN_FRAC and bot_frac > OK_BTN_FRAC
+    top_frac = float(bright[0].mean())
+    bot_frac = float(bright[-1].mean())
+    left_frac = float((bright[:, 0] | bright[:, 1]).mean())
+    right_frac = float((bright[:, -2] | bright[:, -1]).mean())
+
+    r = OK_BTN_SURROUND_ROWS
+    above = gray[y0 - r:y0, x0:x1 + 1]
+    below = gray[y1 + 1:y1 + 1 + r, x0:x1 + 1]
+    above_mean = round(float(above.mean()), 1)
+    below_mean = round(float(below.mean()), 1)
+    surround_mean = max(above_mean, below_mean)
+    border_mean = round(float(box[0].mean() + box[-1].mean()) / 2.0, 1)
+    contrast = round(border_mean - surround_mean, 1)
+
+    checks = {
+        "top": top_frac > OK_BTN_FRAC,
+        "bottom": bot_frac > OK_BTN_FRAC,
+        "vertical": (left_frac >= OK_BTN_EDGE_FRAC
+                     or right_frac >= OK_BTN_EDGE_FRAC),
+        "surround_dark": surround_mean <= OK_BTN_SURROUND_MAX,
+        "contrast": contrast >= OK_BTN_CONTRAST_MIN,
+    }
+    ev.update({
+        "top_frac": round(top_frac, 3),
+        "bottom_frac": round(bot_frac, 3),
+        "left_frac": round(left_frac, 3),
+        "right_frac": round(right_frac, 3),
+        "above_mean": above_mean,
+        "below_mean": below_mean,
+        "surround_mean": surround_mean,
+        "border_mean": border_mean,
+        "contrast": contrast,
+        "checks": checks,
+    })
+
+    hit = all(checks.values())
     state = TriState.TRUE if hit else TriState.FALSE
     ev["state"] = state.value
+    if not hit:
+        # 用失败项名字直接说明假阳性来源，便于日志复盘。
+        ev["reason"] = "structure_reject:" + ",".join(
+            k for k, ok in checks.items() if not ok)
     return state, ev
 
 

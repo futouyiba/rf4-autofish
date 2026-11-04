@@ -4,6 +4,8 @@
   * 画面由调用方（适配层）抓好后传进来，本模块**不碰窗口、不碰帧源**；
   * `autofish_observation.observe_frame` 把同一帧拆成事实；
   * `autofish_state.ShadowStateTracker` 做连续帧防抖，给稳定状态；
+    调用点的 `source` 会作为动作上下文（wait_bite/pull/lift/cast_*/settle_*）
+    原样传给它 —— 同样的像素在不同阶段含义不同，source 不是日志装饰；
   * 本模块只决定"这一帧要不要打日志"，以及"打什么"。
 
 三条硬约束（改动前请先读）：
@@ -123,6 +125,9 @@ class ShadowObserver:
     def update(self, image, foreground: bool, source: str = ""):
         """吃一帧，必要时打一行日志。返回 StateEstimate 或 None。
 
+        `source` 是**调用点的动作上下文**（wait_bite/pull/lift/cast_*/settle_*），
+        原样交给状态机参与候选判定，并写进日志。它不是像素推断出来的。
+
         返回值**仅供调用方记录/调试**；不要用它改变按键、等待或阶段。
         """
         if not self.enabled:
@@ -130,7 +135,7 @@ class ShadowObserver:
 
         try:
             obs = observe_frame(image, foreground=bool(foreground))
-            estimate = self._tracker.update(obs)
+            estimate = self._tracker.update(obs, context=source)
         except BaseException as exc:              # noqa: BLE001 - 必须全吞
             if isinstance(exc, KeyboardInterrupt):
                 raise
@@ -180,7 +185,9 @@ class ShadowObserver:
             f"conf={estimate.confidence:.2f} "
             f"fish={obs.get('fish_icon', '?')} "
             f"bar={obs.get('bar_level')}/{obs.get('bar_tier')} "
-            f"ring={ring_s} source={source or '-'} | "
+            f"ring={ring_s} "
+            f"source={source or '-'} "
+            f"ctx={evidence.get('context') or '-'} | "
             f"reason={estimate.reason}"
         )
 

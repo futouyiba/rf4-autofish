@@ -182,14 +182,27 @@ class TestFishIcon(unittest.TestCase):
 
 
 class TestModalsAndSettlement(unittest.TestCase):
-    def test_ok_button_present(self):
+    @staticmethod
+    def _ok_frame(*, vertical=True, surround=0):
+        """合成「确定」按钮：上下横边 + 可选左右竖边，外面是深色弹窗。
+
+        `surround` 用来模拟夜雾/水面高光（整片亮背景里恰好有两条亮线）。
+        """
         x0, y0, x1, y1 = obs.OK_BTN_BOX
-        a = np.array(canvas(), dtype=np.uint8)
-        a[y0, x0:x1] = (235, 235, 235)
-        a[y1, x0:x1] = (235, 235, 235)
-        state, ev = obs.detect_ok_modal(Image.fromarray(a, "RGB"))
+        a = np.full((H, W, 3), surround, np.uint8)
+        a[y0, x0:x1 + 1] = (235, 235, 235)
+        a[y1, x0:x1 + 1] = (235, 235, 235)
+        if vertical:
+            a[y0:y1 + 1, x0] = (235, 235, 235)
+            a[y0:y1 + 1, x1] = (235, 235, 235)
+        return Image.fromarray(a, "RGB")
+
+    def test_ok_button_present(self):
+        state, ev = obs.detect_ok_modal(self._ok_frame())
         self.assertIs(state, obs.TriState.TRUE)
         self.assertGreater(ev["top_frac"], obs.OK_BTN_FRAC)
+        self.assertGreaterEqual(ev["left_frac"], obs.OK_BTN_EDGE_FRAC)
+        self.assertGreaterEqual(ev["contrast"], obs.OK_BTN_CONTRAST_MIN)
 
     def test_ok_button_absent(self):
         state, _ = obs.detect_ok_modal(canvas())
@@ -202,6 +215,20 @@ class TestModalsAndSettlement(unittest.TestCase):
         a[y0, x0:x1] = (235, 235, 235)
         state, _ = obs.detect_ok_modal(Image.fromarray(a, "RGB"))
         self.assertIs(state, obs.TriState.FALSE)
+
+    def test_ok_button_without_vertical_edges_rejected(self):
+        """只有上下两条亮行、没有左右竖边 = 不是闭合按钮（真实日志 B 的结构）。"""
+        state, ev = obs.detect_ok_modal(self._ok_frame(vertical=False))
+        self.assertIs(state, obs.TriState.FALSE)
+        self.assertFalse(ev["checks"]["vertical"])
+        self.assertIn("vertical", ev["reason"])
+
+    def test_ok_button_on_bright_fog_rejected(self):
+        """整片亮背景（夜雾/水面高光）里两条亮线：外侧不暗、对比不足 -> 拒。"""
+        state, ev = obs.detect_ok_modal(self._ok_frame(surround=190))
+        self.assertIs(state, obs.TriState.FALSE)
+        self.assertFalse(ev["checks"]["surround_dark"])
+        self.assertLess(ev["contrast"], obs.OK_BTN_CONTRAST_MIN)
 
     @staticmethod
     def _settle_frame(width=(711, 1208)):
@@ -231,6 +258,62 @@ class TestModalsAndSettlement(unittest.TestCase):
         state, ev = obs.detect_captured(self._settle_frame(width=(603, 1319)))
         self.assertIs(state, obs.TriState.FALSE)
         self.assertEqual(ev["reason"], "geometry_reject")
+
+
+# ------------------------------------------------ 本地真实截图回归（可选）
+# 这些图只存在于开发机（已被 .gitignore / 发布仓库可能没有）。缺图时跳过，
+# 不允许因此让测试失败；有图时必须通过 —— 它们正是三类误判的真实来源。
+
+REAL_DIR = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _real(name):
+    path = REAL_DIR / name
+    return unittest.skipUnless(path.exists(), f"本地真实截图不存在: {name}")
+
+
+class TestRealScreenshotRegression(unittest.TestCase):
+    @_real("_modal.png")
+    def test_real_ok_modal_still_detected(self):
+        state, ev = obs.detect_ok_modal(Image.open(REAL_DIR / "_modal.png"))
+        self.assertIs(state, obs.TriState.TRUE, ev)
+
+    @_real("_after_ok3.png")
+    def test_real_hovered_ok_modal_still_detected(self):
+        """确定按钮被鼠标悬停成白底时也必须认出来（内部亮 ≠ 假阳性）。"""
+        state, ev = obs.detect_ok_modal(Image.open(REAL_DIR / "_after_ok3.png"))
+        self.assertIs(state, obs.TriState.TRUE, ev)
+
+    @_real("_hud_now.png")
+    def test_real_fog_highlight_is_not_ok_modal(self):
+        """夜雾高光曾让旧判据 top=1.00/bot=0.96 -> 必须拒掉。"""
+        state, ev = obs.detect_ok_modal(Image.open(REAL_DIR / "_hud_now.png"))
+        self.assertIs(state, obs.TriState.FALSE, ev)
+        self.assertIn("surround_dark", ev["reason"])
+
+    @_real("_waterside.png")
+    def test_real_waterside_bar_is_not_settlement(self):
+        """等口/岸边截图：体力条不能被当成结算按钮。"""
+        state, ev = obs.detect_captured(Image.open(REAL_DIR / "_waterside.png"))
+        self.assertIs(state, obs.TriState.FALSE, ev)
+
+    @_real("_waterside.png")
+    def test_real_waterside_bar_is_not_land_in_wait_bite(self):
+        """真实日志 A 的同源画面：bar tier 有值也不是 LAND/FIGHT。"""
+        import autofish_state as astate
+
+        o = obs.observe_frame(Image.open(REAL_DIR / "_waterside.png"),
+                              foreground=True)
+        self.assertIs(o.fish_icon, obs.TriState.FALSE)
+        self.assertIn(o.bar_tier, (1, 2, 3))          # 确实读到了彩色带
+        cand, reason = astate.classify_candidate(o, context="wait_bite")
+        self.assertIs(cand, astate.GameState.WAIT_BITE, reason)
+
+    @_real("_after_dismiss.png")
+    def test_real_settlement_still_detected(self):
+        """真实结算画面必须继续命中（证明几何判据没有被误伤）。"""
+        state, ev = obs.detect_captured(Image.open(REAL_DIR / "_after_dismiss.png"))
+        self.assertIs(state, obs.TriState.TRUE, ev)
 
 
 # ---------------------------------------------------------------- HUD
