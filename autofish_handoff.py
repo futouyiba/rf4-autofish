@@ -43,10 +43,42 @@ import time
 from typing import Any, Dict, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_SNAPSHOT = os.path.join(HERE, "_sniff", "state.json")
+#: 抓包器默认写在源码目录的 _sniff/state.json。
+_SNIFF_REL = os.path.join("_sniff", "state.json")
+DEFAULT_SNAPSHOT = os.path.join(HERE, _SNIFF_REL)
 
 # 快照超过这个年龄视为过期（抓包器每 5s 兜底刷新一次，10s 还没动 = 有问题）
 SNAPSHOT_MAX_AGE = 10.0
+
+
+def resolve_snapshot_path() -> str:
+    """定位 state.json：环境变量 > 可写数据目录 > exe 目录 > 模块目录。
+
+    打包后 ``HERE`` 是临时解包目录（``_internal``），抓包器却写在源码/数据
+    目录，**只认 HERE 会让协议判据整体失效**（2026-11-10 实机踩过：夜间
+    咬钩、收线全部退化成纯视觉，卡在 WAIT_BITE）。
+    """
+    override = os.environ.get("RF4_SNIFF_STATE")
+    if override:
+        return override
+    candidates: list = []
+    try:
+        import app_paths  # noqa: PLC0415
+
+        candidates.append(str(app_paths.data_path("_sniff", "state.json")))
+        candidates.append(str(app_paths.APP_DIR / "_sniff" / "state.json"))
+    except Exception:  # noqa: BLE001 - 独立使用时没有 app_paths 也能跑
+        pass
+    candidates.append(DEFAULT_SNAPSHOT)
+    # 源码目录的上一级（exe 放在 bot/ 子目录里时也能找到）
+    candidates.append(os.path.join(os.path.dirname(HERE), _SNIFF_REL))
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return path
+        except OSError:
+            continue
+    return candidates[0] if candidates else DEFAULT_SNAPSHOT
 
 # casting 接手：按住 F5 的时长。太短抛不出去，太长蓄力过头。
 # 游戏蓄力到 100% 约需 2 秒，抛竿其实只需轻按后松开（短抛）。
@@ -57,9 +89,15 @@ class HandoffError(RuntimeError):
     """接手失败（快照损坏等）。调用方应降级到视觉路径，不应崩溃。"""
 
 
-def read_snapshot(path: str = DEFAULT_SNAPSHOT,
+def read_snapshot(path: Optional[str] = None,
                   now: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """读快照；不存在/损坏/过期返回 None（调用方走视觉兜底）。"""
+    """读快照；不存在/损坏/过期返回 None（调用方走视觉兜底）。
+
+    ``path`` 省略时每次按 :func:`resolve_snapshot_path` 重新定位，这样打包后
+    也能找到抓包器写在别处的文件。
+    """
+    if path is None:
+        path = resolve_snapshot_path()
     try:
         with open(path, "r", encoding="utf-8") as f:
             snap = json.load(f)

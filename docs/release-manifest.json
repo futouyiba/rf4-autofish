@@ -31,7 +31,7 @@
     },
     {
       "path": "autofish_handoff.py",
-      "sha256": "c5a70242763f6e1b5959e27b51b47970f1cc01eae521b89fa7e1611acb368453"
+      "sha256": "d3a59b9edb17900e3164232cb11174db9e5be4fb06bc9f0317e1eedd60271cd4"
     },
     {
       "path": "autofish_hotkeys.py",
