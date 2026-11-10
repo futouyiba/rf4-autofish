@@ -295,7 +295,7 @@
     },
     {
       "path": "docs/exe-guide.md",
-      "sha256": "d98fb03186e25e7d1768e2c0c820080a379c5c910bfaad23879f356a4963b4ff"
+      "sha256": "e198e0488f1a1aec2ccd1ff37edb7ad1483f52054669067209d3e9b3f881b1f5"
     },
     {
       "path": "tests/test_app_paths.py",

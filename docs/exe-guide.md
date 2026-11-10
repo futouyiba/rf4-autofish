@@ -10,7 +10,7 @@
 
 ## 1. 下载与解压
 
-1. 到 [Releases](../../releases) 下载最新的 `RF4AutoFish-vX.Y.Z-win64.zip`（约 70 MB，解压后约 215 MB）。
+1. 到 [Releases](../../releases) 下载最新的 `RF4AutoFish-vX.Y.Z-win64.zip`（约 90 MB，解压后约 215 MB）。
 2. 解压到一个**路径不含中文和空格**的目录，例如 `D:\RF4AutoFish\`。
 3. 目录结构应该是这样（`_internal` 必须和 exe 同级，**不要单独把 exe 拿出来**）：
 
