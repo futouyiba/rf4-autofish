@@ -73,6 +73,12 @@ class FrictionWindowConfig:
     max_sample_gap: float = 1.8
     drop_tail: int = 3
     drop_tail_hits: int = 2
+    # 升档时允许的"非低档（橙）"帧占比。
+    # 2026-11-10 实机：原实现要求窗口里**每一帧都是 1 档**，而大鱼会把力度条
+    # 常量地压在 2 档，一帧橙色就整窗作废 → 摩擦永远停在降档后的 12，每条
+    # 鱼都拉十几分钟甚至拉不上来（连续 3 条 × 20min+）。允许 30% 橙帧：
+    # 红仍由 drop_tail 紧急降档处理，不会因此把线拉爆。
+    rise_orange_tolerance: float = 0.3
 
     def __post_init__(self) -> None:
         if self.window <= 0:
@@ -197,9 +203,13 @@ def evaluate(
     if not valid:
         return None
     valid_tiers = [tier(level) for _, level in valid]
-    # 橙（目标）阻断到它被最近窗口淘汰；红也先交给降档路径处理。
-    if any(value != TIER_LOW for value in valid_tiers):
-        return None
+    # 红先交给降档路径处理（上面已 return）；这里只对橙做比例容忍，
+    # 不再"一帧橙就整窗作废"。
+    if valid_tiers:
+        # TIER_TARGET = 橙（目标档）：不理想但安全，允许占少数
+        orange = sum(1 for value in valid_tiers if value == TIER_TARGET)
+        if orange / len(valid_tiers) > cfg.rise_orange_tolerance:
+            return None
 
     reads = len(valid)
     if reads < cfg.min_reads:

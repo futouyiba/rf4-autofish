@@ -590,13 +590,17 @@ FRICTION_RISE_DIV = 5          # 10 秒全绿 -> 升 1/5：17 + 17//5 = 20（向
 FRICTION_WINDOW = 10.0     # 观察窗口：过去 10 秒
 FRICTION_SAMPLE = 0.2       # 采样间隔
 FRICTION_RISE_GAP = 5.0     # 升档后再升的最短间隔（玩家 02:41：升完过5s再看）
-FRICTION_RECOVER_GAP = 10.0  # 降档后再升的最短间隔（红事件后谨慎恢复，防震荡）
+# 2026-11-10 实机：原 10s + 80% 全绿，大鱼永远给不出这么干净的画面，于是
+# 第一次红事件把 17 降成 12 之后**再也升不回来**，每条鱼都拉十几分钟。
+# 实测两条 60s 上鱼、之后连续三次 20min+ 拉不上来，都是卡在这个 12 档。
+# 降到 6s/66%：仍然要求"多数帧是绿的"，但不再要求完美。
+FRICTION_RECOVER_GAP = 6.0   # 降档后再升的最短间隔（红事件后谨慎恢复，防震荡）
 FRICTION_DROP_GAP = 6.0     # 两次降档至少隔 6 秒：一次红事件只降一次
 FRICTION_RISE_MIN_READ = 3  # 升档前窗口内至少 3 次真实读到"最低档"
-FRICTION_FIRST_OBSERVE = 10.0  # 首次有效观察必须满 10 秒（校准时刻不参与）
+FRICTION_FIRST_OBSERVE = 6.0  # 首次有效观察必须满 6 秒（校准时刻不参与）
 FRICTION_MAX_SAMPLE_GAP = 1.8  # 真实读数间隔超过它 = 观察中断，重新累计
 FRICTION_SCROLL_GAP = 0.055    # 每格之间的间隔
-FRICTION_LOCK = 0.8            # 调整后锁这么久，避免连续触发
+FRICTION_LOCK = 0.66           # 升档前窗口里 1 档帧的最低占比
 
 _FW_CONFIG = fwin.FrictionWindowConfig(
     window=FRICTION_WINDOW,

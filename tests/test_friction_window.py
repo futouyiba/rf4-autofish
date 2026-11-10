@@ -179,19 +179,28 @@ class DropTests(unittest.TestCase):
 
 
 class TargetTierTests(unittest.TestCase):
-    def test_orange_blocks_until_window_eviction(self):
-        samples: list[tuple[float, int]] = []
-        state = fw.FrictionObservationState()
-        self.assertIsNone(feed_range(samples, state, 0.0, 4.5))
-        # 5.0 读到橙（目标）：命中目标，不升。
-        self.assertIsNone(feed(samples, state, 5.0, TARGET))
-        self.assertIsNone(feed_range(samples, state, 5.5, 10.1))
-        # 10.1 时橙距现在 5.1s，仍在 10 秒窗口里，继续阻断。
-        self.assertIsNone(feed_range(samples, state, 10.5, 15.0))
-        # 15.1 时橙已被窗口淘汰，观察仍在（持久 epoch），可以升。
-        self.assertEqual(
-            feed(samples, state, 15.1, LOW).action, fw.ACTION_RISE
-        )
+    """橙色（目标档）不再"一帧作废整窗"，改为按比例容忍（默认 30%）。"""
+
+    CFG = fw.FrictionWindowConfig(lock=0.0, first_observe=4.0)
+
+    def _state(self):
+        # 观察纪元已经跑够时间，直接考察"橙帧比例"这一条
+        return fw.FrictionObservationState(observe_since=0.0, last_valid_ts=4.5)
+
+    def test_minority_orange_still_allows_rise(self):
+        # 11 帧里 1 帧橙（9%）→ 允许升档（大鱼常态压在 2 档）
+        samples = [(i * 0.5, LOW) for i in range(11)]
+        samples[5] = (2.5, TARGET)
+        decision = fw.evaluate(samples, self._state(), 5.0, self.CFG)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action, fw.ACTION_RISE)
+
+    def test_majority_orange_still_blocks(self):
+        # 5 帧里 3 帧橙（60%）→ 阻断，避免把泄力一路打紧
+        samples = [(0.0, TARGET), (0.5, LOW), (1.0, TARGET),
+                   (1.5, LOW), (2.0, TARGET)]
+        decision = fw.evaluate(samples, self._state(), 2.0, self.CFG)
+        self.assertIsNone(decision)
 
 
 class CommitTests(unittest.TestCase):
