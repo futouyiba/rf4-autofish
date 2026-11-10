@@ -227,6 +227,12 @@ class LifecycleConfig:
     relogin_line_low: float = 0.15
     # 连续多少帧都低于阈值才动作；防止单帧误读直接退游戏。
     relogin_line_frames: int = 2
+    # 搏斗僵死看门狗。挂底时协议会一直报 fighting、圆环和出线都不再变化，
+    # 状态机会无限拉扯（2026-11-10 实机：连续多条 20 分钟+ 才被人工打断）。
+    # 超过这个秒数、圆环又没有实质改善，就当挂底处理：收线、回 PROBING 重抛。
+    fight_stall_timeout: float = 240.0
+    # 圆环（线杯剩线比例）要改善多少才算"有进展"。0.01 ≈ 1%。
+    fight_stall_ring_gain: float = 0.01
     fight: afm.FightConfig = field(default_factory=afm.FightConfig)
 
     def __post_init__(self) -> None:
@@ -445,6 +451,11 @@ class LifecycleCoordinator:
         self._reason = "boot"
         self._state_since = self._now()
         self._state_version = 0
+        # 僵死看门狗：以"进入当前状态时的 _state_since"为纪元，
+        # 换了状态就自动重置，不需要在每个 _enter 分支里手工清。
+        self._stall_state_ts: Optional[float] = None
+        self._stall_ring_start: Optional[float] = None
+        self._stall_ring_best: Optional[float] = None
         self._last_step_at: Optional[float] = None
         self._heartbeat = 0.0
         # 协议半途接手元数据（apply_protocol_handoff 填写；snapshot 透出）
@@ -1204,12 +1215,78 @@ class LifecycleCoordinator:
         self._clear_fish()
         self._enter(AutoFishState.PROBING, "retrieved_timeout", now)
 
+    # ---------- 僵死看门狗 ----------
+    def _fight_stalled(self, obs: aobs.Observation, now: float) -> bool:
+        """搏斗僵死（挂底/缠草）检测；命中时收线并回 PROBING。
+
+        判据刻意保守：**只有圆环能读到、且超时时间内没有实质改善**才动作。
+        圆环读不到时一律不动——"没测到"不等于"没进展"，宁可多拉一会儿，
+        也不要把正在上岸的大鱼误判成挂底。
+        """
+        cfg = self._config
+        limit = float(getattr(cfg, "fight_stall_timeout", 0.0) or 0.0)
+        if limit <= 0:
+            return False
+
+        ring = getattr(obs, "ring_ratio", None)
+        ring_ok = isinstance(ring, (int, float)) and math.isfinite(float(ring))
+        ring = float(ring) if ring_ok else None
+
+        # 状态纪元：一旦换了状态（_state_since 变），基线自动重置。
+        if self._stall_state_ts != self._state_since:
+            # 新纪元的第一帧只建立基线，不参与判定（否则一进 FIGHT 就到点）
+            self._stall_state_ts = self._state_since
+            self._stall_ring_start = ring
+            self._stall_ring_best = ring
+            return False
+        if ring is not None:
+            if self._stall_ring_best is None or ring > self._stall_ring_best:
+                self._stall_ring_best = ring
+
+        if now - self._state_since < limit:
+            return False
+
+        start, best = self._stall_ring_start, self._stall_ring_best
+        if start is None or best is None:
+            return False
+        gain_needed = float(getattr(cfg, "fight_stall_ring_gain", 0.01))
+        if best - start >= gain_needed:
+            return False
+
+        if self._cb.retrieve is None:
+            self._blocked_reason = "retrieve_unavailable"
+            self._set_reason("retrieve_unavailable")
+            return False
+        try:
+            result = self._cb.retrieve(self._action)
+        except AutoStop:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._fault_now(
+                "retrieve_failed:%s: %s" % (type(exc).__name__, exc), now
+            )
+            return True
+        finally:
+            self._release_keys("fight_stalled")
+        if result is False:
+            self._fault_now("retrieve_failed", now)
+            return True
+        self._clear_fish()
+        self._enter(AutoFishState.PROBING, "fight_stalled", now)
+        return True
+
     # ---------- FIGHT / LAND / NET ----------
     def _tick_fight(self, obs: aobs.Observation, now: float) -> None:
         # 线杯快被拉空：先停手小退，不再继续拉。放在最前面——比"强捕获"
         # 更优先，因为线断了这条鱼和这套线组都会一起没了。
         if self._line_low_hit(obs):
             self._begin_relogin(now, obs)
+            return
+
+        # 僵死看门狗：挂底/缠草时协议会一直报 fighting，但圆环和出线都不再
+        # 变化，状态机会无限拉扯下去（实测每条 20 分钟以上）。超时且圆环
+        # 没有实质改善 → 当挂底处理：收线、回 PROBING 重新抛。
+        if self._fight_stalled(obs, now):
             return
 
         # 强捕获优先且不看 HUD：新鲜前台连续 2 帧即可停子机转 SETTLE。

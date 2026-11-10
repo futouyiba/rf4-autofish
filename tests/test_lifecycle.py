@@ -509,6 +509,47 @@ class WaitBiteTimeoutTests(unittest.TestCase):
         self.assertEqual(h.count("cast"), 0)
 
 
+class FightStallTests(unittest.TestCase):
+    """挂底看门狗：圆环长时间不动就收线重抛，别无限拉扯。"""
+
+    def _enter_fight(self) -> "Harness":
+        # 默认配置（240s）先把状态推进到 FIGHT，再换成 0 秒触发看门狗，
+        # 避免推进过程中就被看门狗打断。
+        h = Harness()
+        h.advance_to_fight()
+        # 0 表示"关闭"，所以这里用 1ms 让它立刻到点。
+        h.coord._config = alf.LifecycleConfig(fight_stall_timeout=0.001)
+        return h
+
+    def test_stalled_fight_retrieves_and_reprobes(self) -> None:
+        h = self._enter_fight()
+        # 第一帧建立基线，第二帧才判定（ring 恒为 0.5 = 挂底没动）
+        h.step(fish_icon=T.TRUE, ring_ratio=0.5)
+        snap = h.step(fish_icon=T.TRUE, ring_ratio=0.5)
+        self.assertEqual(h.count("retrieve"), 1)
+        self.assertIs(h.coord.state, S.PROBING)
+        self.assertIsNone(snap["fish_id"])
+
+    def test_progressing_fight_is_left_alone(self) -> None:
+        h = self._enter_fight()
+        # 圆环持续改善（0.50 -> 0.60），说明鱼在往回收，不能当挂底
+        h.step(fish_icon=T.TRUE, ring_ratio=0.50)
+        h.step(fish_icon=T.TRUE, ring_ratio=0.55)
+        snap = h.step(fish_icon=T.TRUE, ring_ratio=0.60)
+        self.assertEqual(h.count("retrieve"), 0)
+        self.assertIsNotNone(snap["fish_id"])
+
+    def test_disabled_watchdog_never_retrieves(self) -> None:
+        h = Harness(config=alf.LifecycleConfig(fight_stall_timeout=0.0))
+        h.callbacks  # noqa: B018 - 保持与原测试一致的构造方式
+        h.coord._config = alf.LifecycleConfig(
+            fight_stall_timeout=0.0, fight_stall_ring_gain=0.0
+        )
+        h.advance_to_fight()
+        h.step(fish_icon=T.TRUE, ring_ratio=0.5)
+        self.assertEqual(h.count("retrieve"), 0)
+
+
 class NetConfirmTests(unittest.TestCase):
     def _in_net(self):
         config = alf.LifecycleConfig(
