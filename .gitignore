@@ -1,12 +1,13 @@
 # 第三方 RF4S 源码（需自行 clone，不入库）
 refs/
 
-# 抓包、日志、截图等运行产物
+# 抓包、日志、截图等运行产物（static/ 下的发布模板除外）
 captures/
 *.pcapng
 *.pcap
 *.log
 *.png
+!static/ready_cn.png
 *.jpg
 _stuck/
 run.pid
@@ -24,3 +25,19 @@ venv/
 *.token
 config.local.*
 friction.state
+
+# 运行期端点/进程身份（含 token/PID，绝不入库）与原子写临时文件
+autofish.endpoint.json
+autofish.process.json
+autofish.endpoint.json.*.tmp
+autofish.process.json.*.tmp
+
+# OCR 模型（PP-OCRv6 small det/rec + v4 备份，约 45MB 二进制）不入库：
+# 运行时从本地 models/ocr 加载，离线可用、不下载；部署时自行放入该目录。
+/models/ocr/*.onnx
+
+# 打包产物（exe 走 Release，不入库）
+dist/
+build/
+*.spec.bak
+*.zip

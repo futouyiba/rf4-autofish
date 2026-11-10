@@ -1,10 +1,27 @@
-# 状态机设计（草案 v1，2026-11-04 17:10）
+# 状态机设计与实现（v2，2026-11-05）
 
-> 状态：**未实现**，仅设计。玩家当前手动上鱼中，本文不含任何输入动作。
+> 状态：**已实现并接入正式桥接**（`autofish_bridge.py` + `autofish_runtime.py` +
+> `autofish_ui.py`）。离线测试与实机验收是两件事，分级见 §0.1。
+> 文中带日期的阶段小节是历史记录，保留当时的判断，不代表当前状态。
 
 ## 0. 一句话
 
 把"现在处于哪个阶段"从**代码执行到哪一行**，变成**一个显式、可观测、能从屏幕重新推断的对象**。
+
+## 0.1 当前实现 / 测试 / 实机分级
+
+| 层级 | 现状 | 证据 |
+|---|---|---|
+| 纯离线实现 | 完成 | `autofish_observation.py`、`autofish_state.py`、`autofish_input.py`、`autofish_fight_machine.py`、`autofish_lifecycle.py`、`autofish_control.py`、`autofish_snapshot.py` |
+| 运行接入 | 完成 | `autofish_bridge.py`（真实抓帧/输入/摩擦）、`autofish_runtime.py`（tick + IPC）、`autofish_ipc.py`、`autofish_ui.py` |
+| 离线测试 | **647 项：640 通过 / 7 项跳过** | 发布目录 `python -m unittest discover -s tests`；跳过项只缺本机真实截图（运行产物不入库） |
+| legacy 实机 | **历史记录：已钓到过小鱼** | `rf4s_adapter.py` 旧路径，仅证明基础循环可完成 |
+| 正式桥接实机 | **部署/收网已发送，鱼未入护判 LOST** | 尚未跑通“完整桥接到入护/结算”；不能称收获，也不能称生产可用 |
+| 抄网收网 | **F7；98 入 / 90 出**（动作账） | 不是视觉确认：STOWED/DEPLOYED/UNKNOWN 只记“我方发过什么”；上一轮发送成功但鱼未入护 |
+
+> **不要把“离线测试通过”写成“实机验收通过”**。UI/IPC 只保证不抢焦点、不直接发输入、
+> 关闭 UI 不影响后台进程，不等于钓鱼链路已验收。
+
 
 ## 1. 为什么必须做（今天的事故都能归到三类）
 
@@ -34,11 +51,16 @@
 | `S2_READY` | HUD 全暗（未抛竿） | 全松 | 摩擦校准、抛竿 |
 | `S3_CASTING` | 瞬态（脚本自己发起） | Shift+F5 短暂，之后全松 | 等落水 |
 | `S4_WAIT_BITE` | HUD 亮、鱼图标无、`bar=0`、ring 可读 | 全松 | 清弹窗、等口 |
-| `S5_FIGHT` | 鱼图标 或 `bar>0`，且 `ring<0.9` | **F5+F6 按住** | 摩擦片动态控制 |
-| `S6_LAND` | 鱼图标在 且 `ring>=0.9` | **F5+F6 按住** | 宽限后转 `S7` |
-| `S7_NET` | 抄网站位（`S6` 超时转入） | **F6 按住、F5 松** | PageDown、按需前进 |
+| `S5_FIGHT` | 鱼图标 或 `bar>0`，且 `ring<0.98` | **F5+F6 按住** | 摩擦片动态控制 |
+| `S6_LAND` | 鱼图标在 且 `ring>=0.98` | **F5+F6 按住** | 宽限后转 `S7` |
+| `S7_NET` | 抄网站位（`S6` 超时转入） | **F6 按住、F5 松** | F7 掏网一次；低环自动收网一次 |
 | `S8_SETTLE` | 结算框 / 入护按钮 | 全松 | 点击入护 |
 | `S9_MODAL` | 「确定」按钮（连续 2 帧） | 全松 | 连点清理 |
+| `S10_RELOGIN` | 由 `S5/S6/S7` 的 `ring<0.15` 连续 2 帧触发 | 全松 | Esc→退出→登录；成功回 `S2` 重新校准 |
+
+`S10_RELOGIN` 是一次**阻塞长动作**，期间不产生任何搏鱼输入；结束后一律回
+`S2_READY` 路径上的 CALIBRATING（重新把摩擦校准到 17），不允许直接抛竿。
+细节见 [`relogin.md`](relogin.md)。
 
 ## 3. 启动探针（回答问题 2）
 
@@ -51,7 +73,7 @@
 1. 「确定」按钮连续 2 帧成立            → S9_MODAL
 2. 入护按钮 / 结算框存在                → S8_SETTLE
 3. 鱼图标连续 2 帧存在
-     ring >= 0.90                      → S6_LAND
+     ring >= 0.98                      → S6_LAND
      否则                               → S5_FIGHT
 4. bar 有色（level > 0）               → S5_FIGHT
 5. ring 可读 或 力度条区域有绘制        → S4_WAIT_BITE
@@ -183,7 +205,7 @@ MVP 的安全策略：
 | 收线 45s 超时 | `S4_WAIT_BITE` → 进入时创建 | 退出即销毁 |
 | 无张力 idle 15s | `S5_FIGHT` | 同上 |
 | 临岸宽限 8s | `S6_LAND` | 同上 |
-| 抄网重试计数（≤2） | `S7_NET` | 同上 |
+| 抄网动作/等待 | `S7_NET` | 退出即销毁；失败保持 NET + F6 |
 | 弹窗连点计数 | `S9_MODAL` | 同上 |
 
 **进入状态时创建、退出时销毁**——45 秒计时器泄漏那类 bug 从结构上不可能再出现。
@@ -193,9 +215,10 @@ MVP 的安全策略：
 | 迁移 | guard |
 |---|---|
 | `S4→S5` | 鱼图标连续 2 帧 |
-| `S5→S6` | ring 连续 3 帧 ≥ 0.90（**ring<0 → 永不迁移**） |
-| `S6→S7` | 在 `S6` 停留 ≥ 8s 且未结算 |
-| `S7→S8` | 结算框出现 |
+| `S5→S6` | ring 连续 3 帧 ≥ `ring_min`（默认 0.98：0.973 不 LAND，0.985 连续 3 帧才 LAND；**ring<0 → 永不迁移**） |
+| `S6→S7` | 在 `S6` 停留 ≥ 8s、未结算、`auto_net_enabled` 打开、掏网/收网回调齐全、net 动作账为 STOWED |
+| `S7→S6` | 新鲜有效帧 ring 连续 3 帧 < `net_exit_ring`（默认 0.90，独立于进入阈值，形成 98 入 / 90 出回差），收网成功并等待 1.2s 动画 |
+| `S7→S8` | 结算框出现（强捕获优先，期间不发收网） |
 | 任意 → `S9` | 「确定」按钮连续 2 帧 |
 | 任意 → `S8` | 入护按钮出现 |
 | 任意 → `S0` | 连续 N 秒无任何可读信号 |
@@ -207,7 +230,9 @@ MVP 的安全策略：
   - 今天的一个隐患：`S7` 拉鱼阶段控制器还在跑，档位会被无意义地调
 - `S0_UNKNOWN` 时控制器停摆，且 `calibrated` 置 False
 
-## 8.1 当前实施进度（2026-11-04 17:55）
+## 8.1 历史实施记录（阶段 1，2026-11-04 17:55）
+
+> 以下是当时的阶段记录；“尚未接入运行主流程”只描述 11-04 当时，当前状态见 §0.1。
 
 阶段 1 的纯观测与 shadow 状态推断已完成，**尚未接入运行主流程**，因此不会改变钓鱼行为：
 
@@ -219,6 +244,105 @@ MVP 的安全策略：
 - shadow 抓帧全局最多 **2Hz**（`RF4_SHADOW_SAMPLE_S` 默认 0.5s），限频发生在 PrintWindow 之前；`RF4_SHADOW_STATE=0` 可零开销关闭
 
 主 Agent 审查后额外补了：`Observation.evidence` 深冻结快照、pending 状态不虚增 `stable_frames`，以及 shadow 全局抓帧限频（防 pull 0.2s 循环额外 PrintWindow 5Hz）。
+
+### 阶段 2 离线内核进度（历史，2026-11-04）
+
+> 当时“尚未接入 adapter”已被后续阶段取代；本节保留为历史。
+
+用户确认：调档使用既定安全校准、增量记账和 29 硬顶即可；OCR 核账不是前置条件，本阶段不做。
+
+新增 `autofish_input.py`、`autofish_fight_machine.py` 及对应测试。尚未接入 adapter；没有真实输入 sink，没有启动或操作游戏。全套离线测试 204 项通过，不能视为实机验收通过。
+
+- 唯一输入意图出口：只发 desired/emitted 差集；成功才记 emitted；部分失败保留准确前缀并允许有界重试。
+- FIGHT/LAND 均持有 F5+F6，迁移不松键；NET 只松 F5 保留 F6；捕获确认后才全松。
+- 无 120/180 秒总体搏鱼超时；未知 ring 不触发抄网；临岸连续确认和宽限归属本状态。
+- 摩擦控制授权要求 FIGHT、无故障、输入成功且 F5/F6 已由本 arbiter 成功发出。
+- 重复/倒序帧不累计；帧间隔超过 1.5 秒清连续性，不能把稀疏帧当持续无鱼。
+- ~~抄网切换动作每次 start 最多一次；NET窗口到期或圆环丢失仍保持F6，不自动恢复F5。必须由上层确认网已收回并显式调用 `confirm_net_retracted()` 后才恢复FIGHT；reset/clear_fault不能替代收网确认。~~（**已推翻**：这是“NET 永久人工挂起”的旧语义。现行实现见 §8.2：低环连续帧自动收网，收网成功后等待动画回 FIGHT；`confirm_net_retracted` 只保留为人工兜底。）
+- 观测时间戳必须与monotonic时钟同轴，检查帧龄、未来帧和接收/采集双间隔；失焦、HUD不可读或弹窗时冻结新动作，不把旧帧当新证据。
+- 输入sink显式返回False视为失败；emitted仅是本进程发送账本，不是游戏接收确认。
+- 边界加固后全套离线232项测试通过，仍未接入实机。
+- LOST/SETTLE 释放失败后可重试；用户停止后 tick 不再操作，显式 stop 可重试释放。
+
+集成阻断：Shadow 修复尚需第二轮实机验收；结算几何判据仍待与可靠模板/真实样本核对。完成前禁止将内核接管生产输入。
+
+### 2026-11-05 运行接入实现（已完成接入，待实机入护验收）
+
+运行目录新增 `autofish_fight_runtime.py`；正式入口改为 `autofish_bridge.py`，由
+`autofish_runtime.py` 在主线程 tick，`autofish_ipc.py` 发布快照/接收命令，
+`autofish_ui.py` 走独立进程只读面板。adapter 的旧 patch 仍保留为 legacy：
+`RF4_FIGHT_FSM=1` 曾用于显式开启新内核，默认走 legacy；正式桥接不再依赖这个开关。
+
+实现要点：无鱼抛竿校准有 fail-closed 守卫；每竿 cast 前回 17；新会话未知档位只
+down 30 / up 16；同帧 keep.png 强确认；旧 hold 上下文先退出后接管；释放失败阻断
+recast；失焦冻结新动作，AUTO 回到前台自动恢复，OBSERVE/MANUAL 不自动恢复。
+
+发布目录现在已包含完整 bridge/runtime/UI 与同源测试；**仍未完成实机入护验收**，
+不能称生产可用。抄网仍需明确收网确认来源。未提交、未 push。
+
+### 8.2 2026-11-05 抄网正式链路（F7；98 入 / 90 出）
+
+用户实机确认：
+- 真正“掏网/收网”键是 **F7**。旧 `PageDown` 会放竿/切装备，必须停用。
+- 进入 LAND/NET 的 90% 门槛偏低，默认改为 **0.98**（0.973 不 LAND；0.985
+  连续 3 帧才 LAND）。NET 退出阈值独立保留 **0.90**：0.89 连续 3 帧收网，
+  形成明确的 **98 入 / 90 出** 回差。
+- 上一轮实机：部署与收网注入都成功发送，但鱼未进入鱼护，最终判 **LOST**；
+  这可证明“指令发出”，不能写成“收获”或“入护验收通过”。
+
+实现：
+
+- `FightMachine` 新增 `NetState.STOWED/DEPLOYED/UNKNOWN` 与
+  `net_retract_action`；`RuntimeCallbacks` → `Bridge` 全接线。
+- Bridge 统一 `_net_toggle(reason)`：同一 arbiter 发一次 `f7 down/up`，
+  保持 F6、绝不按 F5；可取消、动作前检查前台恢复、`finally` 释放 F7；
+  掏网/收网分别记 `deploy` / `retract` 日志。
+- **修饰键保护**：F7 是裸键；Ctrl/Alt/Shift 任一被物理按住时不发（会撞
+  `Ctrl+Alt+Shift+F7` 恢复热键），明确报 `net_modifier_held` 并只读阻塞，
+  绝不替用户松键。全局恢复热键本身不改。
+- 初始 `STOWED` 只用于正常新钓鱼会话；中途接管 `UNKNOWN`，禁止盲 toggle。
+  掏网回调成功才 `DEPLOYED`。NET 中新鲜有效帧 ring 连续 3 帧低于
+  `net_exit_ring`（默认 0.90）触发收网；成功后等待 `net_retract_anim`
+  （1.2s，stop 可取消）再 `STOWED` 并回 FIGHT 补按 F5。
+- 部分动作失败 → `UNKNOWN` + fault，保持 F6，不恢复 F5、不重复盲 toggle；
+  `stop` 可释放。回调缺失时 LAND 保持双键，绝不跳过收网直接按 F5。
+- 捕获强确认优先；`None/NaN/失焦/过时/重复` 帧不算低环且中断连续计数。
+  收网后重新累计 3 帧 + 8s（不继承旧计时），并用 `net_cooldown=5s` 抑制振荡。
+- `NET` 无总体放弃超时；`net_window` 只保留一次性提醒。
+- 单源配置：`RF4_AUTO_NET=1` 仅供人工验收，默认 False；Bridge gate 与
+  `FightConfig` 同源，不一致在进入 NET/松 F5 前 preflight 失败。
+- 计时：`fish_elapsed` 从确认中鱼（`hooked_since`）起算；`cast_elapsed`
+  保留从抛竿起算。状态迁移日志带 monotonic + wall（datetime）与
+  ring/fish/tier、原因，不逐 tick 刷新。
+- legacy `rf4s_adapter.net_toggle()` / `_net_action` 的抄网常量与直接注入
+  也已统一引用 `NET_KEY="f7"`；`bot_ctl release` 仍保留 `pagedown`，仅用于
+  清理旧版本可能残留的按键，不作为正式动作。
+
+### 8.3 2026-11-05 线杯圆环自适应亮度（夜间满环不再误判）
+
+**指示器位置**：底部状态图标排的第 2 个，与 `static/*/wheel.png` 同形；
+外圈圆环即“线杯上还剩多少线”，满环 = 线基本都在线杯上（鱼近），环掉下来 = 线被拉出（鱼远）。
+
+**旧实现为什么错**：同一帧实测三个相邻状态图标的环峰值分别是 **109 / 178 / 104**。
+旧代码把“点亮”写死成 `>=180`，于是夜间/HUD 变暗时满环峰值 178 被整圈判成
+“图标没画出来” → `ring=None`（实机已出现）。所有依赖它的判断随之失效：
+临岸不迁移、收网不触发、状态卡在搏鱼里出不来。
+
+**新判据**（`autofish_ring.py`，纯像素、无 IO、无输入；adapter 与
+`autofish_observation` 共用同一实现，不再各存一套常量）：
+
+1. `peak < 60` → `icon_not_drawn`（图标真没绘制/被遮挡），返回 `None` 而非 0；
+2. 否则取该帧峰值按比例判每个角度：`v >= peak*0.68` 记为点亮，步长 2°；
+3. 结构判据：区域均值 `>= peak*0.85` 说明是平坦色块（均匀灰/纯白盘），
+   同样判 `icon_not_drawn`，避免比例法把背景噪声算成满环；
+4. 区域均值 `<20` 直接判 `hud_dark`。
+
+结果：同一满环在 178 与 255 亮度下都读成接近 1.0；`None` 只表示不可读，
+语义上既不等于“0% 线”也不等于“临岸”，沿用 §7 的“未知不迁移”约定。
+
+**验证口径**：真实截图满环 0.983；全黑 `hud_dark`；均匀灰、纯白盘
+`icon_not_drawn`；合成 178 满环 ≥0.95、半环约 0.5。进入阈值 0.98 与
+退出阈值 0.90 不变，本改动只修“读数”，不改控制律。
 
 ## 9. 实施顺序（复审后修订）
 
@@ -233,21 +357,32 @@ MVP 的安全策略：
 | 4 | **迁移完整生命周期**：READY/CASTING/WAIT/FIGHT/LAND/NET/SETTLE/MODAL | 可在任意已识别画面启动；UNKNOWN 零输入 | 按整条鱼切回 legacy |
 | 5 | **独立 UI + IPC** | 杀 UI 不影响 bot；UI 不抢焦点；优雅停止可用 | UI 可选，不启动即可 |
 
+当前落地：阶段 1–5 的代码与离线测试已完成；阶段 0 的“人按 + bot 按 + bot 松”
+实机输入语义仍没有独立结论记录。阶段 5 的 UI 已实现为独立进程，关闭不影响后台。
+实机验收仍未通过入护：上一轮部署/收网发送成功，但鱼未进入鱼护，判 **LOST**；
+legacy 只有“钓到过小鱼”的历史记录，均不能称生产可用。
+
 ### 9.1 关键验收用例
 
-- `ring=None` 永不进入 LAND/NET；`ring>=0.9` 连续 3 帧才进入 LAND。
+- `ring=None` 永不进入 LAND/NET；`ring>=0.98` 连续 3 帧才进入 LAND
+  （0.973 不 LAND；0.985 连续 3 帧 LAND）。
 - `cur=29 + 1档色` 不升；`cur=28 + 1档色` 最多到 29；2 档色不动；红事件正常降。
 - `FIGHT + 档位未知`：滚轮序列严格为 down 30、up 16；任何一步失败都不能写 `calibrated=True`。
 - 校准与动态控制器不能并发。
 - `FIGHT -> LAND` 期望键集合均为 `{F5,F6}`，不产生任何输入事件。
-- `LAND -> NET` 只发 `F5 up`，F6 保持；`NET -> SETTLE` 才全松。
+- `LAND -> NET` 只发 `F5 up` 与一次 F7；F6 保持；Ctrl/Alt/Shift 按住时阻塞。
+- `NET` 中 ring 连续 3 帧 < 0.90（默认退出阈值，0.89 连续 3 帧即触发）：
+  只发一次收网 F7；等待动画后回 FIGHT 并补按 F5。未知/失焦/过时/重复帧不算
+  低环，不恢复 F5。
+- 收网失败/取消：保持 NET + F6 + UNKNOWN fault，不恢复 F5、不重复盲 toggle。
+- 中途接管（`net_state=UNKNOWN`）绝不盲 toggle；正常新会话才假定 STOWED。
 - 状态 duration/deadline 统一用 `time.monotonic()`。
 - UI、日志或截图线程卡住时，状态机 tick 不被阻塞。
 
 ## 10. 这套东西解决不了什么
 
 - **3D 视角抄网**（走过去对准鱼）——状态机只保证"不确定时不作恶"，不提供新能力
-- 断线/重连、小退流程的自动化——需要单独设计
+- **断线后的自动重连**：`S10_RELOGIN` 覆盖的是"自己主动小退"，服务器踢线/断网后的恢复仍要单独设计
 - 网络层佐证（`0e08 fishing/load`）——独立课题
 
 ## 11. 已定 / 待定
@@ -258,20 +393,30 @@ MVP 的安全策略：
    数字是硬护栏（29 顶），色带只管方向和达标（§4.5）。
 2. 判定为 `S5_FIGHT` **直接接管**，不做盲等；改由"物理按键探测 + 两帧 bar 变化"替代（§3.1）。
 
+已定（2026-11-05 实现后）：
+
+3. 按 §9 分步实现，阶段 1–5 的离线部分已完成；正式入口为 `autofish_bridge.py`，
+   legacy 保留为回退。
+
 待定：
 
-3. 实施按 §9 的分步来，还是先只做第 1 步（观测）跑一场看数据？
 4. `GetAsyncKeyState` 能否读到 `pydirectinput` 注入的键——需要一次非钓鱼时段的实测。
+5. 抄网的“我方动作账”已实现（STOWED/DEPLOYED/UNKNOWN + 自动收网），但**视觉**
+   确认来源仍未闭环；当前不能证明游戏侧真的掏/收了网。
+6. 新桥接的实机入护验收；`RF4_AUTO_NET=1` 仅用于该人工验收，默认关闭。
 
 ---
 
-## 12. 右侧图形控制面板（规划）
+## 12. 右侧图形控制面板（已实现）
 
-### 12.1 值得做，但必须是独立进程
+> 实现文件：`autofish_ui.py`；协议与快照字段以 `autofish_ipc.py` / `autofish_runtime.py`
+> 为准。本节保留最初的设计约束，作为评审基线。
+
+### 12.1 独立进程约束（已落实）
 
 UI 不注入 RF4、不改游戏窗口过程，而是一个独立的 Windows 无边框置顶工具窗：
 
-- 用 `GetWindowRect(rf4_x64.exe)` 读取游戏窗口位置
+- 用 `GetWindowRect(rf4_x64.exe)` 读取游戏窗口位置（只读）
 - 窗口放在 `game_right + 8px, game_top`
 - 游戏移动时每 250~500ms 跟随；最小化时隐藏
 - UI 崩溃/关闭不影响 bot；bot 崩溃时 UI 显示离线
@@ -313,19 +458,48 @@ autofish_runtime.py（状态机主进程）
 | 接管 | 先要求外部 F5/F6 全部松开，再由 bot 接管 |
 | 紧急停止 | `taskkill /T /F` + 强制释放；明确标红，可能中断人工输入 |
 
-### 12.5 `bot_ctl.py` 必须同步升级
+### 12.5 `bot_ctl.py` 已升级为两级停止
 
-当前 `stop()` 直接 `taskkill /F`，属于紧急停止。状态机化后分两级：
+现在的 `stop()` 不再直接 `taskkill /F`：
 
-1. **优雅停止**：IPC `stop` → STOPPING → 停新动作 → `release_owned()` → 保存 → 退出
-2. **紧急停止**：优雅停止超时后才 `taskkill /F`；`release_all_force()` 明确可能干扰人工按键
+1. **优雅停止**：IPC `stop` → STOPPING → 停新动作 → `release_owned()` → 保存 → 退出；
+   最多等 3 秒，超时只提示用户，不自动强杀。
+2. **紧急停止**：显式 `emergency-stop` 才 `taskkill /T /F`，且只对
+   `autofish.process.json` 中 pid + 创建时间 + python 镜像 + role 全部可验证的进程执行；
+   随后 `release_keys(focus=True)` 强制松键，明确可能干扰人工输入。
 
-当前 `release_keys()` 还会强制把游戏置前，这也只应留在紧急清理路径；正常停止不抢焦点。
+没有实例时 `stop()` 绝不调用 `release_keys`（不抢前台、不发 keyUp）。`release_keys()`
+的置前行为只保留在紧急/显式释放路径。
 
 ### 12.6 MVP 技术选择
 
 优先 `tkinter + ctypes Win32`：项目已有 Python 运行环境，无新依赖；足够实现 320px 右侧工具窗、置顶、跟随、按钮、状态数据。先不做透明 overlay、DLL 注入、游戏内绘制。
 
-### 12.7 UI 上线顺序
+### 12.7 UI 上线顺序（已上线）
 
-UI 放在状态机第 5 阶段：前四阶段先把状态、输入 owner、计时器和启动初始化做可靠。UI 可以提前做静态原型，但**不能反过来驱动旧的散乱业务代码**。
+UI 已作为独立进程实现，只读快照、只发语义命令；关闭 UI 后台继续。上线顺序仍遵守：
+先保证状态、输入 owner、计时器和启动初始化，UI 不反向驱动旧的散乱业务代码。
+
+---
+
+## 13. 发布与测试
+
+发布目录 `rf4-autofish-pub/` 包含正式桥接、legacy adapter、UI、IPC 与离线测试；
+运行目录的自动化模块按同源同步，两处差异只在路径入口（见 manifest 备注）：
+
+- `rf4s_adapter.py`：发布版 `REF_DIR` 为 `RF4S_REF` → `refs/` → `vendor/` 兜底，
+  不含本机绝对路径；运行目录同一模块默认指向本机 `refs/`。
+- `bot_ctl.py`：发布版解释器按 `RF4_PYTHON` → `RF4S_REF` 下 venv → 当前解释器解析，
+  legacy cwd 在 `refs/` 不存在时退回本目录；运行目录仍以本机 `refs/` venv 为准。
+- `ready_cn.png` 随发布同步；抓包、截图、日志、endpoint/process/PID、`friction.state`
+  与 token **不同步**，并由 `.gitignore` 忽略。
+
+离线测试（不启动 bot / GUI）：
+
+```bash
+cd rf4-autofish-pub
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+当前结果：**569 项通过，7 项跳过**（缺本机真实截图）。文件清单与 sha256 见
+`docs/release-manifest.json`。

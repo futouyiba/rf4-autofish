@@ -1,0 +1,305 @@
+{
+  "note": "发布文件清单，路径相对仓库根目录并统一使用 /；rf4s_adapter.py 与运行目录相比仅 REF_DIR 解析块不同（RF4S_REF -> refs/ -> vendor/ 兜底，无本机绝对路径）；bot_ctl.py 增加 RF4_PYTHON/RF4S_REF 解析且不假定 vendor/.venv 存在；tests/test_bot_ctl.py 的 legacy cwd 断言跟随 bot_ctl.LEGACY_CWD。autofish_friction_window.py 为摩擦观察窗纯判据（首次 10s / rise5 / drop10 / 长空档重置）。OCR 层为 cv2.dnn + PP-OCRv6（不用 onnxruntime），三件套 autofish_ocr.py / autofish_ocr_client.py / autofish_ocr_service.py 走独立 venv-ocr 服务进程；models/ocr/*.onnx 约 45MB 不入库（见 .gitignore），发布时需本地放入。未包含 vendor/、venv-ocr、运行产物、endpoint/process/PID、日志、截图与 token。 autofish_relogin.py 为线杯剩线 <15% 的小退重登（Esc→退出→登录，亮度结构判据，不用 OCR），对应 docs/relogin.md 与 tests/test_relogin.py。 autofish_nav.py 为坐标驱动导航（位移反推朝向，自适应转向速度，不依赖罗盘），对应 docs/nav.md 与 tests/test_nav.py。 autofish_places.py + record_place.py 为三层配置：地图 → 目的地（多个，kind 区分钓位/鱼市）→ 策略（跨图复用；friction_base 限制 1..29；缺图/缺点位/多钓位未选都不猜），对应 docs/nav.md 第 6 节与 tests/test_places.py。 record_place.py 支持 record 热键录制（Ctrl+Alt+Shift+F11 记点 / F12 结束，自动编号，两帧稳定性校验，不抢焦点，每点自动存缩略截图方便改名）。 rf4_sniff.py 为常驻协议抓包器+状态机（RC4 握手解密，0e02/0e0b/0e05 边沿 + 0e07/0e08 持续态，0e08 float 落盘；输出 _sniff/events.jsonl 与 state.json）。autofish_handoff.py 为 bot 半途接手（读 state.json 按 phase 决定进入状态与按键策略，fighting 不动键、casting 短按 F5 再松、快照过期走视觉兜底；bridge 启动时经 LifecycleCoordinator.apply_protocol_handoff 应用，FIGHT 档位不可信仍由 friction_untrusted 防线兜底）。对应 tests/test_sniff_state.py 与 tests/test_handoff.py。 decode_rf4.py 提供 RC4 实现（rf4_sniff 的依赖，含离线 pcap 解码 CLI）。 协议实时判据全链路已实机验收：0e02/0e0b/0e05 边沿 + 0e07/0e08 持续态、0e08 float 偏移实测校准、handoff 按 phase 接手（fighting 不动键）、咬钩图标盲区用协议补、入护后 4s 静默期防空打；详见 docs/protocol-state.md。 打包层 app_paths/app_main 统一开发态与 PyInstaller 冻结态的路径解析：可写数据落 %LOCALAPPDATA%\\RF4AutoFish，只读资源留在 _internal；同一个 exe 用 --bot/--ctl 切角色，rf4autofish.spec + build_exe.sh 产出绿色版 zip；使用说明见 docs/exe-guide.md。",
+  "files": [
+    {
+      "path": "agent_hook.py",
+      "sha256": "fa34e27ac60bf5d86082724c87561fc9808f726cc942ebc316edc415190813ed"
+    },
+    {
+      "path": "agentctl.py",
+      "sha256": "019fd8e86ca31dd151136ae26fd5f3b1655285177233cff75333f65c55c7cbe7"
+    },
+    {
+      "path": "autofish_bridge.py",
+      "sha256": "5fac3ba9d46995e177d04b93feab08ece5329ce35bc8b9941cfebe1282ad02ef"
+    },
+    {
+      "path": "autofish_control.py",
+      "sha256": "5aa31a9913c5bf757da5e2242ca3bde756ed43f6757e830a3f9dc2170dd430d4"
+    },
+    {
+      "path": "autofish_fight_machine.py",
+      "sha256": "ac29b40d513e7298d9bedc36c1590360a5d1a7366c0de4a8c954fbdec3f86200"
+    },
+    {
+      "path": "autofish_fight_runtime.py",
+      "sha256": "7a0522ac8d82d24ee6f7321fc678caea68af06832b699f0666fb9b7e3215df6d"
+    },
+    {
+      "path": "autofish_friction_window.py",
+      "sha256": "60b9310dde89137de99b950cc76f7036e05c2885593b929a79dfa177912426cd"
+    },
+    {
+      "path": "autofish_handoff.py",
+      "sha256": "c5a70242763f6e1b5959e27b51b47970f1cc01eae521b89fa7e1611acb368453"
+    },
+    {
+      "path": "autofish_hotkeys.py",
+      "sha256": "626862b9b775812fa75375c74ff6c06667b9c6a7245a090d52f9fde9a079b175"
+    },
+    {
+      "path": "autofish_input.py",
+      "sha256": "74fe9e3043a64d2f13818c239bd47c5f54ffe72a2c2977da973597abc23efeff"
+    },
+    {
+      "path": "autofish_ipc.py",
+      "sha256": "184634f7023339363d0bf234105619c81f1471ea3ce0b588923fa58947be65b8"
+    },
+    {
+      "path": "autofish_lifecycle.py",
+      "sha256": "03b40988dbb25ec737cb0eaecb7d4f64bf9915d9c9c7e6558c59bd246af02467"
+    },
+    {
+      "path": "autofish_nav.py",
+      "sha256": "09046d89f9ef369fbf6d916c9eb6825601d44aca03159c6f6f3b1747b9ada3d4"
+    },
+    {
+      "path": "autofish_observation.py",
+      "sha256": "6b271ce43df1a896961ee0d8184348419f69de84fd2390db77b22d16bf1018de"
+    },
+    {
+      "path": "autofish_ocr.py",
+      "sha256": "a64238f6f906ba21c3e4a1f810a490d66d84cb4c47f1bc4a54721830ca0c2051"
+    },
+    {
+      "path": "autofish_ocr_client.py",
+      "sha256": "b2d91d87465479109a37050d33a77125359ef7371fe67cfa6ccfea7210e21416"
+    },
+    {
+      "path": "autofish_ocr_service.py",
+      "sha256": "85613dd59b33cf59ae96d9dc19dc868b6d47da348e20ba55cb23f72068a275e9"
+    },
+    {
+      "path": "autofish_places.py",
+      "sha256": "e05710043503ffaac3b3f4d920e5424f70dfd492bbfa29a7c2781545dd93a464"
+    },
+    {
+      "path": "autofish_relogin.py",
+      "sha256": "42ffda7c5bd005e3aa1a9be7736b0d272175845cf8fde6d101e31793b59ffe11"
+    },
+    {
+      "path": "autofish_ring.py",
+      "sha256": "05fbcc2139daeecca90a0caeeef18972ada5617ac2844edc2f01c32793fb00a4"
+    },
+    {
+      "path": "autofish_runtime.py",
+      "sha256": "f202e19726c082791a23baef0d6e0e39fd7638e8fd137a6f6ead6f7212368561"
+    },
+    {
+      "path": "autofish_shadow.py",
+      "sha256": "0c904c96dfbadc9fca50ac9564a34363e52a875cfa1a1a478e2f7c5bf72049bc"
+    },
+    {
+      "path": "autofish_snapshot.py",
+      "sha256": "872695257ce4e07ecc15265ea21ffddb6d9388cfc5ebd99d367e53cd1e373542"
+    },
+    {
+      "path": "autofish_state.py",
+      "sha256": "b2a4e172bfe87e7c1aa01d77294ab44ff3d5b5e7cecab5dc1fd8469f79972052"
+    },
+    {
+      "path": "autofish_ui.py",
+      "sha256": "1bf8232da171e7b76556a8d71b9e4434fe2bbeef46f9460ce3d0d2a6e251822a"
+    },
+    {
+      "path": "bot_ctl.py",
+      "sha256": "227a6d676bee3fd3afd86b4ea0e76de8aa55903c4b42badda56b9d21e7e51629"
+    },
+    {
+      "path": "decode_rf4.py",
+      "sha256": "0fde7eff232c998a211c558ffec283c282cae720384e822d23035234e337d20f"
+    },
+    {
+      "path": "friction_state.py",
+      "sha256": "329ac2dbaeb4c93b5d5136ab7d3d4305cd303eba429eaba70e6a4d899738ffc1"
+    },
+    {
+      "path": "record_place.py",
+      "sha256": "06187a4b2ce8a19dd9d5092368181bfb0b38da7461b54cd3de5e882acac82175"
+    },
+    {
+      "path": "rf4_focus.py",
+      "sha256": "1445a9358433c5becc4a4dfcec3899461b19b1c775d6dae289e72a51dbab407f"
+    },
+    {
+      "path": "rf4_sniff.py",
+      "sha256": "811b50c8281aa6a179413678b5bbbce8300a3c478a1749ce4d29e6d582b8b0dd"
+    },
+    {
+      "path": "rf4s_adapter.py",
+      "sha256": "d52ff13c577ccd5b5cccb84bdfde740332e7a774051cca7dff20f0128892363e"
+    },
+    {
+      "path": "static/ready_cn.png",
+      "sha256": "62173af856850ff37fa3185081e92cf3cab7a499a5a13a784b693bd3440bf4c9"
+    },
+    {
+      "path": "README.md",
+      "sha256": "214268e17860ab20f2dbb2bb11428a637a2c2120f958d0697416402642f73f75"
+    },
+    {
+      "path": "docs/chinese-reference-review.md",
+      "sha256": "8861b7e6ccad039f8703a223a1ade5026f36597d799484b3864eaf29ab487b8d"
+    },
+    {
+      "path": "docs/friction-control.md",
+      "sha256": "b4da955a3fbf7ae6fa780bf34d488eefa630add7290882f68d60a777111f14b8"
+    },
+    {
+      "path": "docs/modals.md",
+      "sha256": "35ecfc1433e3d2ebd7deb065c4c6da8609a7e8040fcec4906ed339a5b10a3619"
+    },
+    {
+      "path": "docs/nav.md",
+      "sha256": "608731e4b8cd60a289142b751e1146072e70ccf223003df9b86117f43130cebe"
+    },
+    {
+      "path": "docs/ocr.md",
+      "sha256": "00c2df9bd7d9373da8f47aa130191824c4f6414acd728d599901ff53a71ba0e7"
+    },
+    {
+      "path": "docs/protocol-state.md",
+      "sha256": "f80c78d7bcefe7399fe423a2eb3cf659bf57c86d53514eb498f1eefb79aab49b"
+    },
+    {
+      "path": "docs/relogin.md",
+      "sha256": "7bad8825b2c2961bb9581c20a0de835a921d9e6f52240bd1715de8ae44f3ef0e"
+    },
+    {
+      "path": "docs/state-machine.md",
+      "sha256": "2258ee53ec64b48a0320c60cd75ae796e3e7e1b3cf465b230373c38d0c3f1737"
+    },
+    {
+      "path": "tests/test_bot_ctl.py",
+      "sha256": "c36997d3695247abe83e53740a4d40e6136539d6020e1ce60b0baa4b925b2aaf"
+    },
+    {
+      "path": "tests/test_bridge.py",
+      "sha256": "ad8fea1a4f88bb9cf691853d2a3529600af7ca829db7542be9a04c1239ec45b4"
+    },
+    {
+      "path": "tests/test_capture_keep_retry.py",
+      "sha256": "05a6b8130e7800e9ad3b6865a3719a2291cfef1d4136dda4f211f0e2869cb6be"
+    },
+    {
+      "path": "tests/test_control.py",
+      "sha256": "71886475d9a6340909c01e0790bcb87f8ec1abc5fc7890733a688d74802cd945"
+    },
+    {
+      "path": "tests/test_fight_machine.py",
+      "sha256": "50bd4e7cec140064c3542b6d597082214c0ee6fe35e002342c2f2d161ea42693"
+    },
+    {
+      "path": "tests/test_fight_runtime.py",
+      "sha256": "0b25c1cbd7344ea63a66e84146becb25f3901347039bcd6d9b22902a6e15deb4"
+    },
+    {
+      "path": "tests/test_friction_window.py",
+      "sha256": "8abdb4596991e3ce0e1fd31818fc3d29f1947b83d03684ef2c498ac94cee3897"
+    },
+    {
+      "path": "tests/test_fullflow_runtime.py",
+      "sha256": "1081f23625f5e647296ae8df238604367d619463b4a514d39a0667b0bcdfde42"
+    },
+    {
+      "path": "tests/test_handoff.py",
+      "sha256": "373c0af4cd2e5acd7237202921616fb6cbbc123f9b4d0d39eeb4043749706f51"
+    },
+    {
+      "path": "tests/test_hud_watchdog.py",
+      "sha256": "1c6040a4f16b6022c4e803d9c1841379ebb185f3db8a72c1872c5de8bfd815e6"
+    },
+    {
+      "path": "tests/test_input_arbiter.py",
+      "sha256": "084c14cd38d553980a3de9bf9655213becee3eeaeb450d2d68a3cfc2ede4da72"
+    },
+    {
+      "path": "tests/test_ipc.py",
+      "sha256": "0096ed0ce798dc405e617145d90a2627059c89fcd927b98251ea59758b8b9a21"
+    },
+    {
+      "path": "tests/test_lifecycle.py",
+      "sha256": "7d805ca6ef28d096245b8d20d9c72ead2b21f8e24a64018344129ecd33b22b56"
+    },
+    {
+      "path": "tests/test_live_startup_regressions.py",
+      "sha256": "711e14f44659177853a3b3094a4f670be45b27d16ca1501805826f2305804033"
+    },
+    {
+      "path": "tests/test_nav.py",
+      "sha256": "bf832b90b71387b3dd3c8d852bc4933efaaf86efbcf3a8aaff1dc5002fb4aedf"
+    },
+    {
+      "path": "tests/test_observation.py",
+      "sha256": "9b0e3e5d957485cafec152b74b006d9d5d1135c05866e6ed56cfe148f4f13b2c"
+    },
+    {
+      "path": "tests/test_ocr_client.py",
+      "sha256": "81f8dfa8cfe5905baee8eca15bbe7a890e36095f0116711a1fb5967d4b2fcc55"
+    },
+    {
+      "path": "tests/test_places.py",
+      "sha256": "bed18b14e09e630a509009730d8340a5cf77d5b08930e564893050fcaa01224e"
+    },
+    {
+      "path": "tests/test_record_place_cli.py",
+      "sha256": "2d442985284beecd55e4bd31de46a65b8b80213f880c256c0f6865e25fd315f4"
+    },
+    {
+      "path": "tests/test_relogin.py",
+      "sha256": "5ca999f3dcc6d1bb1b0ffa23bf56d16cc7b35c88f28df7d5be3ff97ae9705dbf"
+    },
+    {
+      "path": "tests/test_shadow_integration.py",
+      "sha256": "1cebc6beb601a351632d66ed1a8ed7215a6aa036301427b829070b355192070a"
+    },
+    {
+      "path": "tests/test_sniff_state.py",
+      "sha256": "e36d1f6108a6f812a0c27e77b55854466549760c8bffdd6632d32bc933435fa6"
+    },
+    {
+      "path": "tests/test_state_shadow.py",
+      "sha256": "b4e8d6ea98cfe1c308d9245b46f66db6fd05698f359697b54f570f6275c1292c"
+    },
+    {
+      "path": "tests/test_ui_hotkeys.py",
+      "sha256": "42f2947ec9f86f7f749802a039c542efedc4d94c5baee695d117f34f71cca428"
+    },
+    {
+      "path": "tests/test_ui_model.py",
+      "sha256": "ace57e4d82bb4b4a716a365b5477cca649eba23b45c5c3c312a0f092c8f902a8"
+    },
+    {
+      "path": "app_paths.py",
+      "sha256": "63e7b566e418e47eefae9ec6665c8abd51ba0bd4fc8213ee75eb957ae1170418"
+    },
+    {
+      "path": "app_main.py",
+      "sha256": "a4ec60fedb0a449346c2acf9c07645e2e1750ca30166b25b75f5cf27d9fdadec"
+    },
+    {
+      "path": "rf4autofish.spec",
+      "sha256": "52fcf59d0b77dcd8b2b3d259f86bec7fcc6daa36caa5c102cb2326587cdc8da0"
+    },
+    {
+      "path": "build_exe.sh",
+      "sha256": "ac54089e4bb23931649eb3738008d61c3acc211a6bad5915973f766b27336ae6"
+    },
+    {
+      "path": "assets/rf4autofish.ico",
+      "sha256": "4f6e6940f324cf05f325cc7ab8da3891dfe4c1e6678c8da4441806463b06d11b"
+    },
+    {
+      "path": "assets/rf4autofish.png",
+      "sha256": "b33582960a72ca5da01356be65b54205d69b668423ed2b836c30a3d3e5af62a6"
+    },
+    {
+      "path": "docs/exe-guide.md",
+      "sha256": "d98fb03186e25e7d1768e2c0c820080a379c5c910bfaad23879f356a4963b4ff"
+    },
+    {
+      "path": "tests/test_app_paths.py",
+      "sha256": "bd603f3f21239615cfab0acb4c67f1f964bfec4ce110a42e771bfe1aa579838c"
+    }
+  ]
+}

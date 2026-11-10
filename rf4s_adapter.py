@@ -1,6 +1,6 @@
 """RF4S 适配启动器（不改 RF4S 源码，运行时打补丁）。
 
-解决本客户端（第三方汉化/私服客户端 rf4_x64.exe）的四个不兼容：
+解决本客户端（A:/RF4_CN_daoban2/Game/rf4_x64.exe）的四个不兼容：
   1. 独占渲染：ImageGrab / mss 截图全黑 -> 改用 PrintWindow 合成虚拟桌面
   2. 鼠标注入无效：mouseDown/Up -> keyDown/Up('f5'/'f6')（F5=基本操作，F6=抬竿）
   3. 抛竿需全力抛：Shift + 左键按住 1 秒
@@ -20,11 +20,14 @@
 import ctypes
 import ctypes.wintypes as wt
 
+import autofish_ring
 import friction_state
 import math
 import os
 import sys
 import time
+
+import autofish_friction_window as fwin
 from pathlib import Path
 
 import win32con
@@ -35,19 +38,22 @@ import numpy as np
 
 ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
-# ---- RF4S 源码位置（第三方项目快照在 vendor/，也可用环境变量 RF4S_REF 指定）----
-REF_DIR = Path(os.environ.get("RF4S_REF",
-                              Path(__file__).resolve().parent / "refs" / "RussianFishing4Script"))
-if not REF_DIR.exists():
-    alt = Path(__file__).resolve().parent / "vendor"
-    if (alt / "rf4s").exists():
-        REF_DIR = alt
+# ---- RF4S 源码位置（第三方克隆，被 .gitignore 排除，不入库）----
+# 开发态 = bot/refs/RussianFishing4Script；打包态 = exe 的 _internal（里面有
+# rf4s 模块 + static/ + config.yaml）。路径解析集中在 app_paths，别在这里
+# 再写死盘符 —— 写死会让 exe 换台机器就跑不起来。
+from app_paths import DATA_DIR as _APP_DATA_DIR  # noqa: E402
+from app_paths import is_frozen as _is_frozen  # noqa: E402
+from app_paths import ref_dir as _app_ref_dir  # noqa: E402
+
+REF_DIR = _app_ref_dir()
 if not REF_DIR.exists():
     raise SystemExit(f"[patch] 找不到 RF4S 源码目录: {REF_DIR}\n"
-                     f"       请 clone RussianFishing4Script 到 refs/，或设置 RF4S_REF，"
-                     f"或使用仓库内置的 vendor/ 目录")
+                     f"       请先 git clone 到该路径（见 bot/RF4S-NOTES.md）")
 sys.path.insert(0, str(REF_DIR))
-os.chdir(REF_DIR)
+# 冻结态的 REF_DIR 是只读资源目录，chdir 进去会让 rf4s 的 config/log 写不进去；
+# 改到可写数据目录。开发态保持原行为（相对路径模板与历史一致）。
+os.chdir(_APP_DATA_DIR if _is_frozen() else REF_DIR)
 
 GAME_TITLE = "Russian Fishing 4"
 TARGET_W, TARGET_H = 1920, 1080
@@ -94,6 +100,13 @@ def prepare_window(h: int) -> tuple:
     _orig_state["rect"] = win32gui.GetWindowRect(h)
     _orig_state["style"] = win32gui.GetWindowLong(h, win32con.GWL_STYLE)
     u = ctypes.windll.user32
+
+    cr = wt.RECT()
+    if not u.GetClientRect(h, ctypes.byref(cr)):
+        raise RuntimeError("[patch] 无法读取客户区，停止窗口准备")
+    if (cr.right, cr.bottom) == (TARGET_W, TARGET_H):
+        print("[patch] 客户区已是 1920x1080，保留现有窗口位置和样式", flush=True)
+        return cr.right, cr.bottom
 
     # 确保有标题栏（无边框全屏会让 DWM 进 direct-flip，拖慢其他窗口）
     st = u.GetWindowLongW(h, win32con.GWL_STYLE)
@@ -315,6 +328,9 @@ def patch_screenshot(pag):
         return p == expectedRGBColor
 
     def _hits(tpl_path, confidence):
+        confidence = float(confidence)
+        if not (0.0 <= confidence <= 1.0):
+            raise ValueError("template confidence must be finite and in [0, 1]")
         tpl = cv2.imread(str(tpl_path))
         if tpl is None:
             return []
@@ -444,19 +460,34 @@ def patch_bottom_mode_held():
                             # 说明画面被菜单/能力解锁弹窗之类盖住了 —— 常规循环
                             # 不可能自己脱困，交给 Agent 看截图决定点哪里。
                             try:
-                                if line_ring_ratio() < 0:
+                                # 等口/待抛竿时圆环可能尚未绘制，缺环本身不能证明卡死。
+                                # 真正的确定弹窗仍由上方 maybe_dismiss 独立处理。
+                                # 仅显式诊断开关允许旧的“缺环即异常”策略。
+                                if (os.environ.get("RF4_WAIT_RING_WATCHDOG", "0") == "1"
+                                        and line_ring_ratio() < 0):
                                     if hud_lost_since is None:
                                         hud_lost_since = time.time()
                                     elif time.time() - hud_lost_since > 15:
-                                        # 先自己试着清"排队弹窗"（能力解锁/升级/技能点，
-                                        # 长得一模一样、点掉一个立刻弹下一个）
-                                        cleared = False
+                                        # 先确认「确定」按钮真的在，再去点。
+                                        # dismiss_modals() 对"本来没有弹窗"也不能
+                                        # 返回 True —— 旧代码把这个 True 当成
+                                        # "排队弹窗已清完"，于是每 15 秒谎报一次并
+                                        # continue，把真正的 HUD 卡死吞掉了。
+                                        outcome = "error"
                                         try:
-                                            cleared = dismiss_modals()
+                                            outcome = resolve_unreadable_hud(
+                                                line_ring_ratio,
+                                                _ok_button_present,
+                                                dismiss_modals,
+                                            )
                                         except Exception:
                                             pass
-                                        if cleared:
-                                            print("[patch] 排队弹窗已自动点完", flush=True)
+
+                                        if outcome == "recovered":
+                                            # 只有"点完弹窗 -> 重新抓帧读环成功"
+                                            # 才算 HUD 恢复。
+                                            print("[patch] 排队弹窗已自动点完，HUD 恢复",
+                                                  flush=True)
                                             hud_lost_since = None
                                             try:
                                                 if self.detection.is_fish_captured():
@@ -464,6 +495,19 @@ def patch_bottom_mode_held():
                                             except Exception:
                                                 pass
                                             continue
+                                        if outcome == "healthy":
+                                            # 两次检测之间 HUD 自己回来了
+                                            hud_lost_since = None
+                                            continue
+
+                                        if outcome == "no_modal":
+                                            print("[patch][warn]ring unreadable no modal",
+                                                  flush=True)
+                                        else:
+                                            print(f"[patch][warn]ring unreadable "
+                                                  f"after modal: {outcome}", flush=True)
+                                        # 不 continue：走既有 agent_hook 上报路径，
+                                        # 避免"没弹窗"被当成已处理而跳过升级。
                                         import agent_hook
                                         print("[patch] HUD 连续 15s 不可读，上报 Agent",
                                               flush=True)
@@ -549,25 +593,61 @@ FRICTION_RISE_GAP = 5.0     # 升档后再升的最短间隔（玩家 02:41：�
 FRICTION_RECOVER_GAP = 10.0  # 降档后再升的最短间隔（红事件后谨慎恢复，防震荡）
 FRICTION_DROP_GAP = 6.0     # 两次降档至少隔 6 秒：一次红事件只降一次
 FRICTION_RISE_MIN_READ = 3  # 升档前窗口内至少 3 次真实读到"最低档"
+FRICTION_FIRST_OBSERVE = 10.0  # 首次有效观察必须满 10 秒（校准时刻不参与）
+FRICTION_MAX_SAMPLE_GAP = 1.8  # 真实读数间隔超过它 = 观察中断，重新累计
 FRICTION_SCROLL_GAP = 0.055    # 每格之间的间隔
 FRICTION_LOCK = 0.8            # 调整后锁这么久，避免连续触发
+
+_FW_CONFIG = fwin.FrictionWindowConfig(
+    window=FRICTION_WINDOW,
+    first_observe=FRICTION_FIRST_OBSERVE,
+    rise_gap=FRICTION_RISE_GAP,
+    recover_gap=FRICTION_RECOVER_GAP,
+    drop_gap=FRICTION_DROP_GAP,
+    lock=FRICTION_LOCK,
+    min_reads=FRICTION_RISE_MIN_READ,
+    max_sample_gap=FRICTION_MAX_SAMPLE_GAP,
+)
 
 # 启动时优先用盘上保存的档位（friction.state，由上次会话写入）。
 # ⚠️ 2026-11-04 review A1.1：之前硬编码 17，脚本重启后游戏侧实际档位可能是任意值，
 # 记账从第一秒起就错。落盘文件若存在且标记已校准，就用它；否则等第一次抛竿校准。
 def _init_fric():
+    state = fwin.FrictionObservationState()
     try:
         import friction_state
         saved = friction_state.get()
         if saved is not None:
             return {"cur": saved, "t": 0.0, "calibrated": True,
-                    "_restored": True}
+                    "_restored": True, "_fwin": state}
     except Exception:
         pass
-    return {"cur": FRICTION_INITIAL, "t": 0.0, "calibrated": False}
+    return {"cur": FRICTION_INITIAL, "t": 0.0, "calibrated": False,
+            "_fwin": state}
 
 
 _fric = _init_fric()
+
+
+def _fwin_state() -> fwin.FrictionObservationState:
+    """持久观察状态；兼容测试/旧进程里没有该键的 ``_fric``。"""
+    state = _fric.get("_fwin")
+    if not isinstance(state, fwin.FrictionObservationState):
+        state = fwin.FrictionObservationState()
+        _fric["_fwin"] = state
+    return state
+
+
+def friction_reset_observation(keep_last_action: bool = True) -> None:
+    """清观察纪元与连续观察状态，但**不动** ``cur``、不发滚轮。
+
+    bridge 在以下时机调用：
+
+    * 校准成功：``keep_last_action=False``（连同 last_action/last_drop 一起清）
+    * ``friction_step(None)`` 冻结：``keep_last_action=True``（保留最后调整类型）
+    * 确认新鱼开始：``keep_last_action=False``（样本窗口由调用方清空）
+    """
+    _fwin_state().reset(keep_last_action=keep_last_action)
 
 
 def _drop_target(cur: int) -> int:
@@ -580,7 +660,7 @@ def _rise_target(cur: int) -> int:
     return min(FRICTION_MAX, cur + max(1, cur // FRICTION_RISE_DIV))
 
 
-def _wheel(n: int) -> None:
+def _wheel(n: int) -> bool:
     """滚轮 n 格（正=加档，负=减档），**并立刻把这个变化记进 _fric["cur"]**。
 
     这里必须自己是唯一入口：只要有一次"滚了但没记账"，后面所有的判断都建立在错的
@@ -589,7 +669,12 @@ def _wheel(n: int) -> None:
 
     玩家确认（2026-11-04）：这套滚轮方式一直是有效的（抛竿前"滚满 30 再退回 17"
     那套绝对校准就是用它做的），所以保持原样。
+
+    返回是否**真的滚了并记账**。调用方（尤其摩擦控制器）只能在这个返回 True 时
+    清观察窗口 / 推进 last_action，失败轮绝不能假装调整过。
     """
+    if n == 0:
+        return True
     # A1.3（review）：置前失败 = 一格没滚 = 绝不能记账，还要标记档位不可信，
     # 强制下次抛竿重新绝对校准。
     if not _wheel_raw(n):
@@ -600,11 +685,12 @@ def _wheel(n: int) -> None:
         _fric["calibrated"] = False
         print("[patch][warn] 滚轮未送达，档位标记为不可信（下竿前将重新校准）",
               flush=True)
-        return
+        return False
     _fric["cur"] = max(FRICTION_MIN, min(FRICTION_MAX, _fric["cur"] + n))
     _fric["t"] = time.time()
     friction_state.set(_fric["cur"], calibrated=_fric.get("calibrated", False))
     print(f"[patch] 摩擦片 -> {_fric['cur']} 档（{n:+d}）", flush=True)
+    return True
 
 
 def _wheel_raw(n: int) -> bool:
@@ -621,8 +707,49 @@ def _wheel_raw(n: int) -> bool:
     return True
 
 
-def friction_absolute(target: int = FRICTION_INITIAL) -> None:
-    """绝对校准：先滚到顶（30），再退回 target。
+def _no_fish_gate(img) -> tuple[bool, str]:
+    """同一帧确认"线上确实没鱼，可以安全地滚到顶"。
+
+    只认四条**可读**的事实，缺一条就拒绝：
+
+      1. 画面是 1920x1080 参考尺寸；
+      2. 游戏窗口在前台（滚轮只会打给前台窗口）；
+      3. 圆形鱼图标**明确为 FALSE**（UNKNOWN/异常都不算）；
+      4. 结算框**明确为 FALSE**（UNKNOWN/异常都不算）。
+
+    刻意**不要求力度条可见**：待抛竿 HUD 可能无色甚至不绘制力度条，把它当
+    "无鱼"的反证会让每竿都无法校准。这里只回答能不能顶档，不回答 HUD 全貌。
+    """
+    if img is None:
+        return False, "no_frame"
+    try:
+        size = tuple(img.size)
+    except Exception:
+        return False, "unreadable_frame"
+    if size != (TARGET_W, TARGET_H):
+        return False, f"frame_size_{size[0]}x{size[1]}"
+    try:
+        if ctypes.windll.user32.GetForegroundWindow() != game_hwnd():
+            return False, "background"
+    except Exception:
+        return False, "foreground_unknown"
+
+    import autofish_observation as aobs
+
+    try:
+        fish, _ = aobs.detect_fish_icon(img)
+        if fish is not aobs.TriState.FALSE:
+            return False, f"fish_{fish.value}"
+        captured, _ = aobs.detect_captured(img)
+        if captured is not aobs.TriState.FALSE:
+            return False, f"capture_{captured.value}"
+    except Exception as exc:
+        return False, f"detect_error:{type(exc).__name__}"
+    return True, "no_fish"
+
+
+def friction_absolute(target: int = FRICTION_INITIAL) -> bool:
+    """绝对校准：先滚到顶（30），再退回 target；返回是否**确认成功**。
 
     **每次抛竿前都做**（玩家 2026-11-04 04:17 明确要求，理由也是对的）：
 
@@ -632,22 +759,32 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
       * 每条鱼的起点都确定是 17，搏鱼中的调整可以放心做，下一条鱼自动归位
 
     代价是每竿多约 2.4 秒（43 格滚轮 × 55ms），可以接受。
+
+    ⚠️ 2026-11-05（新内核接入）：**返回值语义变了**。旧版遇到任何异常都
+    `except: pass` 然后继续顶档（fail-open），鱼还挂着也可能滚到 30 直接断线。
+    现在只有 `_no_fish_gate` 明确确认“无鱼 + 前台 + 参考尺寸 + 无结算”才允许
+    滚轮；判据读取失败一律 `return False`，由 `cast()` 拒绝抛竿。滚到顶前的
+    鱼情检查也不再 fail-open。
     """
     if not focus_game_quiet():
         print("[patch][warn] 摩擦片绝对校准跳过：游戏窗口没能置前", flush=True)
-        return
-    # A2（review）：滚满 30 之前的硬守卫——线上有鱼时顶满档会直接断线。
-    # 正常抛竿流程到不了这里，但"人工上鱼等待超时后鱼仍挂着"等边角路径会。
+        return False
     try:
-        if fish_icon_present():
-            print("[patch][warn] 鱼还在钩上，跳过绝对校准（标记待重校准）",
-                  flush=True)
-            _fric["calibrated"] = False
-            return
-    except Exception:
-        pass
+        img, _pos = capture_game()
+    except Exception as exc:
+        print(f"[patch][warn] 摩擦片校准前抓帧失败：{type(exc).__name__}: {exc}",
+              flush=True)
+        _fric["calibrated"] = False
+        return False
+    safe, why = _no_fish_gate(img)
+    if not safe:
+        print(f"[patch][warn] 不能确认线上无鱼（{why}），跳过绝对校准，"
+              f"标记待重校准", flush=True)
+        _fric["calibrated"] = False
+        return False
     if not _wheel_raw(FRICTION_ABS_TOP):
-        return
+        _fric["calibrated"] = False
+        return False
     time.sleep(0.2)
     if not _wheel_raw(-(FRICTION_ABS_TOP - target)):
         # 退档失败：此时游戏在 30 顶格，绝不能记成 target
@@ -657,12 +794,15 @@ def friction_absolute(target: int = FRICTION_INITIAL) -> None:
         except Exception:
             pass
         print("[patch][warn] 退档失败，游戏仍在顶格，标记待重校准", flush=True)
-        return
+        return False
     _fric["cur"] = target
     _fric["t"] = time.time()
     _fric["calibrated"] = True
+    _fric.pop("_restored", None)  # 本会话实校准成功，不能再按旧落盘值重复校准
+    friction_reset_observation(keep_last_action=False)
     friction_state.set(target, calibrated=True)
     print(f"[patch] 摩擦片绝对校准 -> {target} 档（抛竿前，线上无鱼，安全）", flush=True)
+    return True
 
 
 def _reset_friction_for_fish() -> None:
@@ -679,20 +819,25 @@ def _reset_friction_for_fish() -> None:
               flush=True)
         return
     cur = _fric["cur"]
-    _fric["_last_drop"] = 0.0
-    _fric.pop("_last_action", None)   # L5：跨鱼残留会让升档白等 10s
+    # 新鱼：清观察纪元/样本/上次动作，不依据校准时刻继续计时。
+    friction_reset_observation(keep_last_action=False)
     if cur == FRICTION_INITIAL:
         return
     friction_nudge(FRICTION_INITIAL - cur)
     print(f"[patch] 新的一条鱼：摩擦片恢复 -> {FRICTION_INITIAL} 档", flush=True)
 
 
-def friction_nudge(delta: int) -> None:
-    """增量调整：只滚需要的那几格，档位由 _wheel 统一记账。"""
+def friction_nudge(delta: int) -> bool:
+    """增量调整：只滚需要的那几格，档位由 _wheel 统一记账。
+
+    返回是否真的发生了调整；调用方据此决定是否清观察窗口 / 推进 last_action。
+    """
     if delta == 0:
-        return
+        return False
     target = max(FRICTION_MIN, min(FRICTION_MAX, _fric["cur"] + delta))
-    _wheel(target - _fric["cur"])
+    if target == _fric["cur"]:
+        return False
+    return _wheel(target - _fric["cur"])
 
 
 def _tier(lvl: int) -> int:
@@ -704,92 +849,69 @@ def _tier(lvl: int) -> int:
     阈值 2026-11-04 12:49 由玩家指认截图标定：橙/黄绿分界=29（25 与 33 的中点）。
     分类器 0（空载/松线瞬间）按 1 档对待——松线不该阻止升档判断。
     """
-    if lvl >= 4:
-        return 3
-    if lvl == 3:
-        return 2
-    return 1
+    return fwin.tier(lvl)
 
 
 def friction_controller_step(win: list) -> None:
-    """搏鱼中的摩擦片控制（2026-11-04 03:02 定稿：降=事件驱动，升=状态驱动）。
+    """搏鱼中的摩擦片控制（降=事件驱动，升=状态驱动）。
 
-    ## 为什么两个方向用不同的算法
+    ## 2026-11-05 修复的真实 bug
 
-    **降档（红）是"事件"**：红的语义是"现在正在超载"，是紧急信号。
-    看历史窗口反而有害 —— 第 9 秒红过一次降了档，第 14 秒回看"过去 10s"
-    仍含那次红，会二次降档把泄力打到地板（玩家指出的陷阱）。
-    所以降档只看**当下尾部**，配冷却期。
+    旧实现把 ``t0 = _fric["t"]``（上次调整/校准时刻）当成升档观察起点。校准
+    可能发生在很久以前，恢复的落盘状态甚至直接是 ``t=0``；只要窗口里凑够
+    3 个低档读数，``now - t0 >= 5`` 立刻成立，中鱼 2 秒就可能 17→20。
+    同时 bridge 校准成功后没有清 ``_last_action``，跨鱼残留会让首次升档
+    错误地使用 5 秒而不是 10 秒。
 
-    **升档（绿）是"状态"**："一直绿"是持续轻松的判断，必须看一段历史。
-    但窗口起点 = **上次调整时刻 T0**（玩家指定）：T0 之前的样本反映的是
-    旧档位下的力度，混进来会把判断带偏。
+    现在观察起点是纯模块里的持久 ``observe_since``：第一次真实读到
+    ``level > 0`` 时设置，**不随滑动窗口首项移动**。首次升档必须连续观察
+    满 10 秒；之后升档 5 秒、降档后恢复 10 秒。真实读数长空档（>1.8s）
+    会重置连续观察，避免“3 帧低 → 干等 10 秒 → 升档”。
 
     ## 规则
 
-    降档（尾部确认 + 冷却）：
-      * 最近 3 帧（~0.6s）里 ≥2 帧是 3 档（红）→ 立刻降 1/3（17→12→8…）
-      * 距上次降档 <6s 不降（同一红事件去重；6s 后仍红则说明鱼真的强，再降）
+    降档（尾部确认 + 冷却，保持紧急）：
+      * 最近 3 帧里 ≥2 帧是 3 档（红）→ 立刻降 1/3（17→12→8…），不等 10 秒
+      * 距上次成功降档 <6s 不降（同一红事件去重；6s 后仍红说明鱼真的强）
 
-    升档（只看 T0 之后的数据）：
-      * 窗口 = [T0, now]，全部为 1 档（出现橙=命中目标不升；出现红走降档）
-      * 真实读到 1 档（有色带）≥3 次；松线空读不算数但也不阻断
-      * 距 T0：上次动作是升档 → ≥5s；上次动作是降档 → ≥10s（红后谨慎恢复）
+    升档（只看 observation epoch 之后的数据）：
+      * 全部为 1 档；橙（目标）阻断到它从最近 10 秒窗口淘汰
+      * 真实读到 1 档（有色带）≥3 次；``level == 0`` 不算低、不参与判断
+      * 当前帧必须真实为 1 档；首次 ≥10s，之后 5s（降档后 10s）
       * 动作：升 1/5（17→20），上限 29
 
-    每次调整后清空样本窗口，从 T0 重新累计。
+    只有 ``friction_nudge`` 实际成功（滚轮送达并记账）才提交状态并清空
+    样本窗口；失败轮不推进 observe epoch，也不写 last_action/last_drop。
     """
     now = time.time()
-    while win and now - win[0][0] > FRICTION_WINDOW:
-        win.pop(0)
-    if not win:
-        return
-    if now - _fric["t"] < FRICTION_LOCK:      # 滚轮刚动过，先等生效
+    state = _fwin_state()
+    decision = fwin.evaluate(win, state, now, _FW_CONFIG)
+    if decision is None:
         return
 
-    t0 = _fric["t"]                            # 上次调整时刻
-    tiers = [(t, _tier(l)) for t, l in win]
-
-    # ---- 降档：红事件（只看当下尾部 + 冷却去重）----
-    tail = [tier for _, tier in tiers[-3:]]
-    if (tail.count(3) >= 2
-            and now - _fric.get("_last_drop", 0.0) >= FRICTION_DROP_GAP):
-        target = _drop_target(_fric["cur"])
-        if target < _fric["cur"]:
-            print(f"[patch] ★红事件 降档 {_fric['cur']} -> {target}"
-                  f"（尾部3帧 {tail}）", flush=True)
-            _fric["_last_drop"] = now
-            _fric["_last_action"] = "drop"
-            friction_nudge(target - _fric["cur"])   # nudge 更新 _fric["t"]
+    if decision.action == fwin.ACTION_DROP:
+        before = _fric["cur"]                     # 必须在 nudge 之前取
+        target = _drop_target(before)
+        if target >= before:
+            return
+        if friction_nudge(target - before):
+            print(f"[patch] ★红事件 降档 {before} -> {target}"
+                  f"（尾部3帧 {list(decision.tail)}）", flush=True)
+            fwin.commit(state, decision, now)
             win.clear()
         return
 
-    # ---- 升档：只统计 T0 之后的**真实读数** ----
-    # ⚠️ 必须剔除 lvl==0 的样本：那是"力度条无色"＝这一瞬间鱼没在拉（鱼在歇、
-    # 或者线已经收到岸边），它既不能证明"负载低"，也不该参与"一直绿"的判断。
-    # 之前 idle 只有 2 秒时攒不下几个 0，问题被掩盖了；idle 提到 15 秒后一次
-    # 能攒 70+ 个 0，而 _tier(0)==1，会凑出"10 秒全 1 档"导致鱼刚歇完就误升档。
-    since = [(t, _tier(lvl), lvl) for t, lvl in win
-             if t >= t0 - 0.05 and lvl > 0]
-    if not since:
-        return                                 # 这 10 秒全是空档，没有信息量
-    s_tiers = [tier for _, tier, _ in since]
-    if max(s_tiers) != 1:                      # 有橙/红 → 不是"一直低"
+    before = _fric["cur"]                         # nudge 会更新档位，日志要用调整前的值
+    target = _rise_target(before)
+    if target <= before:
         return
-    n_real_low = len(since)                    # since 里已经全是真实低档读数
-    gap = (FRICTION_RECOVER_GAP if _fric.get("_last_action") == "drop"
-           else FRICTION_RISE_GAP)
-    if (n_real_low >= FRICTION_RISE_MIN_READ
-            and now - t0 >= gap):
-        target = _rise_target(_fric["cur"])
-        if target > _fric["cur"]:
-            print(f"[patch] ▲调整后全1档 升档 {_fric['cur']} -> {target}"
-                  f"（T0后真实低档读数 {n_real_low} 次，距T0 {now - t0:.1f}s）",
-                  flush=True)
-            _fric["_last_action"] = "rise"
-            friction_nudge(target - _fric["cur"])
-            win.clear()
-    # max == 2（橙 = 目标）：不动
+    if friction_nudge(target - before):
+        print(f"[patch] ▲调整后全1档 升档 {before} -> {target}"
+              f"（真实低档读数 {decision.reads} 次，连续观察 "
+              f"{decision.observed:.1f}s）", flush=True)
+        fwin.commit(state, decision, now)
+        win.clear()
+    # 2 档（橙 = 目标）：纯模块直接返回 None，不动
 
 
 def _game_gray():
@@ -825,7 +947,11 @@ def patch_cast(pdi):
             pass
         time.sleep(0.15)
         maybe_dismiss("抛竿前")            # 卡牌/技能/升级弹窗会吃掉 Shift+F5
-        friction_absolute(FRICTION_INITIAL)   # 每竿前都校准（线上无鱼，安全）
+        # 校准返回 False = 不能确认"线上无鱼/画面有效"。此时**绝不抛竿**：
+        # 旧版在这里静默继续，鱼还挂着也可能把摩擦片顶到 30 直接断线。
+        if not friction_absolute(FRICTION_INITIAL):
+            raise RuntimeError(
+                "摩擦片绝对校准失败或无法确认线上无鱼，放弃本次抛竿")
         self.stage = StageId.CAST
         focus_game_quiet()
 
@@ -1088,38 +1214,19 @@ LINE_RING_ACTIONS = True
 
 
 def line_ring_ratio() -> float:
-    """线长圆环的点亮比例 0..1；画面不可读时返回 -1（未知，不参与判断）。"""
+    """线杯圆环的点亮比例 0..1；画面不可读时返回 -1（未知，不参与判断）。
+
+    判定规则在 `autofish_ring.measure_ring()`：按当前帧峰值自适应亮度，
+    不再用写死的 180 阈值——夜间 HUD 变暗时峰值只有 178，旧逻辑会整圈
+    判成"图标没画"，导致临岸/收网判断全部拿不到输入（2026-11-05 实机）。
+    """
     img, _ = capture_game()
-    a = np.asarray(img.convert("L")).astype(int)
-    cx, cy = LINE_RING_CENTER
-    r0, r1 = LINE_RING_RADII
-    if a.shape[0] <= cy + r1 or a.shape[1] <= cx + r1:
+    ratio, ev = autofish_ring.measure_ring(np.asarray(img.convert("L")))
+    if ratio is None:
+        if ev.get("reason") not in ("hud_dark", "icon_not_drawn"):
+            print(f"[patch][warn] 线长圆环不可读：{ev.get('reason')}", flush=True)
         return -1.0
-
-    region = a[cy - r1:cy + r1 + 1, cx - r1:cx + r1 + 1]
-    if float(region.mean()) < 20:          # 全黑 = HUD 没画出来
-        return -1.0
-
-    lit = 0
-    total = 0
-    peak = 0
-    for deg in range(0, 360, 3):
-        rad = math.radians(deg)
-        best = 0
-        for r in range(r0, r1 + 1):        # 环有 2~3px 厚，取该角度最亮的一圈
-            x = int(round(cx + r * math.cos(rad)))
-            y = int(round(cy + r * math.sin(rad)))
-            best = max(best, int(a[y, x]))
-        peak = max(peak, best)
-        total += 1
-        if best >= LINE_RING_LIT:
-            lit += 1
-
-    # 整圈最亮的角度都不到阈值 = 这个图标根本没画出来（HUD 隐藏 / 结算界面盖住），
-    # 和"圆环真的空到 0%"是两回事，必须区分，否则会疯狂误触发"立刻小退"。
-    if peak < LINE_RING_LIT:
-        return -1.0
-    return lit / total if total else -1.0
+    return ratio
 
 
 def patch_pull_continuous(timeout=PULL_TIMEOUT):
@@ -1414,7 +1521,7 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                 # 也没有"拉不动"的判断——线在路上就一直拉。
                 # 圆环 >=90%（线基本收回）却拉不上来：此时才考虑套抄网——
                 # 先继续拉 STUCK_GRACE 秒给鱼游到岸边的余地，还不结算就
-                # 掏抄网（PageDown），掏完继续拉等结算。
+                # 掏抄网（F7），掏完继续拉等结算。
                 try:
                     ring = line_ring_ratio()
                 except Exception:
@@ -1438,7 +1545,7 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                               f"（再拉 {LIFT_STUCK_GRACE:.0f}s 不结算就套抄网）",
                               flush=True)
                     elif time.time() - _near_since >= LIFT_STUCK_GRACE:
-                        print("[patch] 线收回了但拉不上来，套抄网（PageDown）",
+                        print(f"[patch] 线收回了但拉不上来，套抄网（{NET_KEY}）",
                               flush=True)
                         import pydirectinput as _pdi
                         _pdi.FAILSAFE = False
@@ -1449,7 +1556,7 @@ def patch_lift_fish(timeout=LIFT_TIMEOUT, manual_wait=600.0):
                         _pdi.keyUp("f5")
                         print("[patch] 已松左键（收线）保持右键（提竿）", flush=True)
                         sleep(0.4)
-                        _pdi.press("pagedown")       # 掏抄网
+                        _pdi.press(NET_KEY)          # 掏抄网（F7；不再用 PageDown）
                         sleep(1.2)                   # 等掏出动画
                         _near_since = time.time() + LIFT_NET_RETRY   # 冷静期：掏出+走过去+兜
                         _net_tried += 1
@@ -1654,8 +1761,13 @@ def patch_fish_captured():
             return False
         if not box:
             return False
-        vx, vy = _vorigin()
-        cx, cy = box.left - vx, box.top - vy        # 转成客户区坐标
+        # locate 返回真实屏幕坐标，必须减游戏客户区原点；
+        # 虚拟桌面原点不是游戏原点，多屏时会凭空多出数千像素。
+        h = game_hwnd()
+        pt = wt.POINT(0, 0)
+        if not ctypes.windll.user32.ClientToScreen(h, ctypes.byref(pt)):
+            return False
+        cx, cy = box.left - pt.x, box.top - pt.y
         x1, y1, x2, y2 = CAPTURE_POS_BOX
         if not (x1 <= cx <= x2 and y1 <= cy <= y2):
             print(f"[patch] keep.png 命中但位置不对 ({cx},{cy})，判为误匹配，忽略",
@@ -1678,6 +1790,27 @@ def patch_fish_captured():
 #   「释放 [Backspace]」边框 x 972..1208, y 940..1008 -> 中心 (1090, 974)
 CAPTURE_KEEP_BTN = (830, 975)      # 实测边框 711..948 x 941..1008
 CAPTURE_RELEASE_BTN = (1090, 975)  # 实测边框 971..1208 x 941..1008
+
+# 入护闭环（2026-11-05 实测）：
+#   * 按钮位置偶尔会变（观测到中心 (780,932)、(824,931)；正常 (829,974)）
+#   * 单次点击后结算**不一定**消失，偶发要点第二/三次
+#   * 结算没消失就记 kept/total 会把"没入护"算成成功，还会重抛浪费一竿
+# 所以：最多点 3 次，每次重新定位；点完等动画，再用 keep.png 强模板复核。
+CAPTURE_KEEP_ATTEMPTS = 3
+CAPTURE_SETTLE_WAIT = 0.8     # 点击后等结算框淡出/按钮反馈的合理时间（秒）
+
+# 定位只在结算框底部这一条合理 ROI 里找（x0, y0, x1, y1，客户区坐标）。
+CAPTURE_BTN_ROI = (600, 900, 1320, 1079)
+CAPTURE_BTN_SINGLE_MIN_W = 150   # 只框到「入护」一个按钮时的最小宽度
+CAPTURE_BTN_BAND_MIN_W = 380     # 整行（入护+释放）≈490px
+CAPTURE_BTN_BAND_MAX_W = 700     # 再宽就是面板线/背景，不是按钮
+
+
+class CaptureKeepNotSettled(RuntimeError):
+    """入护点了 CAPTURE_KEEP_ATTEMPTS 次仍没确认结算消失。
+
+    抛出它 = **不计数、不重抛**：调用方必须停下来，不能把结果标成成功。
+    """
 
 
 # ---- SendInput 点击（mouse_event 在本客户端无效，只有 SendInput 能进 UI 层）----
@@ -1742,29 +1875,46 @@ def find_capture_keep_btn():
     按钮位置**不固定**：结算框底部的奖励行数不一样（有没有"新级别/免费技能点/奖励"），
     按钮会整体上下浮动。实测两种情况：边框 y 941..1008 和 y 969..1049。
     所以扫"底部一对平行的长亮线"当按钮上下边框，中间那条竖线就是两个按钮的分隔。
+
+    2026-11-05：实测定位偶尔给出 (780,932)/(824,931)（正常 (829,974)），
+    这类"弱峰"的成因不止一种（可能只框到一个按钮、也可能是不同结算高度），
+    **不能凭日志断定 932 就是错的**。这里只做两件保守的事：
+      1. 把候选边框对全部打印出来（留证据，方便下次按真实截图复核）；
+      2. 按框宽区分"整行两个按钮"与"只框到一个按钮"，用各自的中心公式，
+         宽度明显不合理（过窄/过宽）就返回 None，让调用方退固定坐标。
     找不到就返回 None，调用方退回到固定坐标。
     """
     img, _ = capture_game()
     a = np.asarray(img.convert("L")).astype(int)
-    y0, y1, x0, x1 = 900, 1079, 600, 1320
+    x0, y0, x1, y1 = CAPTURE_BTN_ROI
     rows = []
     for y in range(y0, y1):
         xs = np.where(a[y, x0:x1] >= 150)[0]
         if len(xs) > 150:
             rows.append((y, x0 + int(xs.min()), x0 + int(xs.max())))
 
-    cand = None
+    cands = []
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
             dy = rows[j][0] - rows[i][0]
             if 40 <= dy <= 90 and abs(rows[i][1] - rows[j][1]) < 8 \
                     and abs(rows[i][2] - rows[j][2]) < 8:
-                cand = (rows[i], rows[j])
-                break
-        if cand:
-            break
-    if not cand:
+                cands.append((rows[i], rows[j]))
+    if not cands:
+        print("[patch] 入护按钮定位：没有成对边框，退固定坐标", flush=True)
         return None
+
+    for (yt, xa, xb), (yb, _, _) in cands[:4]:
+        print(f"[patch] 入护候选边框 y={yt}..{yb} x={xa}..{xb} 宽={xb - xa}",
+              flush=True)
+
+    good = [c for c in cands
+            if CAPTURE_BTN_SINGLE_MIN_W <= (c[1][2] - c[0][1]) <= CAPTURE_BTN_BAND_MAX_W]
+    if not good:
+        print("[patch] 入护按钮定位：候选宽度不合理（弱峰），退固定坐标",
+              flush=True)
+        return None
+    cand = good[0]
 
     (yt, xa, xb), (yb, _, _) = cand
     band = a[yt + 2:yb - 2, xa:xb]
@@ -1773,7 +1923,75 @@ def find_capture_keep_btn():
     cols = (band >= 150).sum(axis=0)
     vs = np.where(cols > (yb - yt - 6) * 0.7)[0]
     mid_x = xa + int(vs[len(vs) // 2]) if len(vs) >= 3 else (xa + xb) // 2
-    return ((xa + mid_x) // 2, (yt + yb) // 2)
+    width = xb - xa
+    if width >= CAPTURE_BTN_BAND_MIN_W:
+        # 整行（入护+释放）：竖线/中点就是分隔线，入护中心在左半边中点
+        cx = (xa + mid_x) // 2
+    else:
+        # 只框到「入护」一个按钮：它的中心就是自己的中点
+        cx = (xa + xb) // 2
+    return (cx, (yt + yb) // 2)
+
+
+def _settle_state(detect) -> tuple[bool, str]:
+    """结算框还在不在：返回 (gone, why)。
+
+    **检测异常一律不算成功**（gone=False）：宁可多等一次，也不能把
+    "读不出来"当成"结算已消失"去记账/重抛。
+    """
+    try:
+        present = bool(detect())
+    except Exception as exc:
+        return False, f"detect_error:{type(exc).__name__}"
+    if present:
+        return False, "still_present"
+    return True, "settled"
+
+
+def click_keep_until_settled(detect, locate, click, wait, dismiss=None,
+                             attempts: int = CAPTURE_KEEP_ATTEMPTS):
+    """点「入护」直到**强模板确认结算消失**，返回成功时的尝试次数。
+
+    每次尝试都：重新定位按钮 -> 点击 -> 等结算动画 -> 用 `keep.png` 复核。
+    复核仍"在"时先清已证 OK 的弹窗（`dismiss`）再复核一次；3 次都不消失就抛
+    `CaptureKeepNotSettled`，交给上层停下——**不记账、不重抛**。
+
+    所有外部动作都由调用方注入，便于离线测试（不截图/不点击）。
+    """
+    why = "not_attempted"
+    for i in range(1, attempts + 1):
+        btn = None
+        try:
+            btn = locate()
+        except Exception as exc:
+            print(f"[patch][warn] 入护按钮定位异常: {type(exc).__name__}: {exc}",
+                  flush=True)
+        if not btn:
+            btn = CAPTURE_KEEP_BTN
+            print(f"[patch] 入护按钮定位失败（弱峰/异常），退固定坐标 {btn}",
+                  flush=True)
+        else:
+            print(f"[patch] 入护按钮定位 {btn}（第 {i}/{attempts} 次）", flush=True)
+        click(btn)
+        wait()
+        gone, why = _settle_state(detect)
+        if gone:
+            print(f"[patch] 结算已消失（第 {i} 次点击后确认）", flush=True)
+            return i
+        print(f"[patch] 第 {i}/{attempts} 次点击后结算仍在（{why}），清弹窗后复核",
+              flush=True)
+        if dismiss is not None:
+            try:
+                dismiss()
+            except Exception as exc:
+                print(f"[patch][warn] 清弹窗失败: {type(exc).__name__}: {exc}",
+                      flush=True)
+        gone, why = _settle_state(detect)
+        if gone:
+            print(f"[patch] 结算已消失（第 {i} 次点击+清弹窗后确认）", flush=True)
+            return i
+    raise CaptureKeepNotSettled(
+        f"入护点击 {attempts} 次仍未确认结算消失（最后状态：{why}）")
 
 
 # ---- 鱼护满了怎么办 ----
@@ -1816,47 +2034,76 @@ def on_keepnet_full(player) -> None:
 # 所以策略从"等 Agent 来救"改成"自己先清，清不掉才上报"：
 #   maybe_dismiss() 在被调用的位置（抛竿前/等口时/入护后/抬竿前）先看一眼，
 #   有就点干净；只有点不掉（按钮消失但 HUD 仍不可读 = 不是这类弹窗）才上报 Agent。
-OK_BTN_BOX = (871, 793, 1048, 826)
 OK_BTN_CENTER = (960, 810)
 
 
 def _ok_button_present() -> bool:
-    """检测「确定」按钮在不在。
+    """检测「确定」按钮在不在（单帧结构判据）。
 
-    判据：按钮上下两条边框线各自的亮像素占比 > 85%。
-    连续两帧都成立才认（防一格闪烁误判成按钮）。
+    复用 `autofish_observation.detect_ok_modal`：按钮必须是闭合矩形
+    （上下 + 至少一条竖边），框外是深色弹窗底板，且亮度对比足够。
+    旧的"上下两条亮线 + 两帧确认"在夜雾/水面高光上会假阳性
+    （见 test_observation 的真实截图回归），也挡不住"画面整体不可读"。
+
+    UNKNOWN（尺寸不对/画面不可读）与异常一律当作"没有按钮" —— 宁可漏点，
+    也不能在 HUD 本来就看不见时乱点。连续帧防抖由状态机负责。
     """
     try:
-        for _ in range(2):
-            img, _ = capture_game()
-            a = np.asarray(img.convert("L")).astype(int)
-            x0, y0, x1, y1 = OK_BTN_BOX
-            top = a[y0, x0:x1]
-            bot = a[y1, x0:x1]
-            if not (int((top >= 150).sum()) > (x1 - x0) * 0.85
-                    and int((bot >= 150).sum()) > (x1 - x0) * 0.85):
-                return False
-            time.sleep(0.05)
-        return True
+        import autofish_observation as aobs
+
+        img, _ = capture_game()
+        state, _ = aobs.detect_ok_modal(img)
+        return state is aobs.TriState.TRUE
     except Exception:
         return False
 
 
 def dismiss_modals(max_clicks: int = 12, gap: float = 0.9) -> bool:
-    """连点「确定」把排队弹窗清空。返回 True 表示清干净了（或本来就没有）。
+    """连点「确定」把排队弹窗清空。
+
+    返回 True **仅当确实点掉过弹窗、并且现在按钮已消失**。
+    本来没有弹窗时返回 False —— 调用方不能拿它证明"HUD 已恢复"；
+    2026-11-05 的谎报就是把这个 True 当成了"排队弹窗已清完"。
 
     弹窗是排队的：点掉"新级别 27"立刻弹"+1 免费技能点"，
     所以要点到按钮消失为止，不能只点一次。
     """
+    clicked = False
     for i in range(max_clicks):
         if _ok_button_present():
             focus_game_quiet()
             _click_client(*OK_BTN_CENTER)
+            clicked = True
             print(f"[patch] 点掉弹窗 #{i + 1}", flush=True)
             time.sleep(gap)
         else:
-            return True
-    return not _ok_button_present()
+            return clicked
+    return clicked and not _ok_button_present()
+
+
+def resolve_unreadable_hud(read_ring, modal_present, dismiss) -> str:
+    """HUD（线长圆环）不可读时的最小恢复决策。
+
+    纯决策函数：抓帧/检测/点击全部由调用方注入，便于离线测试。
+    返回：
+      "healthy"       环已经可读（两次检测之间自己恢复）
+      "no_modal"      没有「确定」按钮 -> **不点**，也不许报"清理成功"
+      "modal_failed"  有按钮但 dismiss 没清掉
+      "recovered"     清掉弹窗后**重新抓帧**读环成功
+      "still_hidden"  弹窗清掉了，但环仍不可读 -> 不许报 HUD 恢复
+
+    注意：recovered 之前必须再调一次 `read_ring()`（新抓帧），
+    不能复用调用前的旧读数；"弹窗消失"不等于"HUD 恢复"。
+    """
+    if read_ring() >= 0:
+        return "healthy"
+    if not modal_present():
+        return "no_modal"
+    if not dismiss():
+        return "modal_failed"
+    if read_ring() >= 0:
+        return "recovered"
+    return "still_hidden"
 
 
 def maybe_dismiss(tag: str = "", quiet: bool = True) -> bool:
@@ -2047,15 +2294,26 @@ def patch_handle_fish_click():
         _shadow_observe("settle_after", force=True)    # shadow：入护后一眼（强制采样）
 
     def _handle_fish(self) -> None:
+        """点「入护」并**确认结算真的消失**（最多 3 次）。
+
+        实测（2026-11-05）：结算框位置偶尔会变，单次点击后也不一定消失。
+        旧实现点一次就无条件 `total/kept += 1`，于是"没入护"被算成成功，
+        还会重抛一竿。现在每次重新定位 -> 点击 -> 等动画 -> `keep.png` 强模板
+        复核；仍在就清已证 OK 的弹窗再复核。3 次仍在不消失就抛错：
+        **不计数、不继续**（外层 handle_fish 因异常不会 add_cast_time/重抛）。
+        """
+        focus_game_quiet()
+        attempt = click_keep_until_settled(
+            self.detection.is_fish_captured,
+            find_capture_keep_btn,
+            lambda btn: _click_client(*btn),
+            lambda: sleep(CAPTURE_SETTLE_WAIT),
+            lambda: maybe_dismiss("入护后"),
+        )
+        logger.info(f"Keep fish by clicking the button (attempt {attempt})")
+
+        # 只有结算框**确实消失**才记账；重试多次也只记一次。
         self.result.total += 1
-        try:
-            focus_game_quiet()
-            btn = find_capture_keep_btn() or CAPTURE_KEEP_BTN
-            print(f"[patch] 入护按钮定位 {btn}", flush=True)
-            _click_client(*btn)
-            logger.info("Keep fish by clicking the button")
-        except Exception as e:
-            print(f"[patch][warn] 点击入护按钮失败: {e}", flush=True)
         self.result.kept += 1
 
         sleep(add_jitter(0.6))
@@ -2079,10 +2337,10 @@ def patch_handle_fish_click():
           f"并跳过 10s 结算动画等待")
 
 
-# 抄网：不再共用空格。客户端里「使用/放下炒网」本来就有**两个**槽位：
-#   Space / PD(PageDown)  ——  见 设置-控制-键盘设置
-# 所以不需要新绑键，直接用 **PageDown**，把 Space 完全让给"入护"（现在入护已经改成点按钮）。
-NET_KEY = "pagedown"
+# 抄网：不再共用空格。客户端里「使用/放下抄网」绑定 **F7**：
+#   实机确认 F7 才是抄网；PageDown 会放竿/切装备，禁止再用于抄网。
+# Space 已让给"入护"（现在入护已经改成点按钮）。
+NET_KEY = "f7"
 
 
 def net_toggle() -> None:
@@ -2269,6 +2527,220 @@ def suppress_ime_overlay() -> int:
     return hidden
 
 
+# ================= 新搏鱼内核（feature flag，默认 legacy） =================
+_fight_tpl = {}          # {path: template | None}；模板只加载一次，失败也不重试
+
+
+def _fight_keep_template(path: str):
+    """keep.png 只加载一次；读不出来返回 None（强信号 UNKNOWN，不兜底几何）。"""
+    if path in _fight_tpl:
+        return _fight_tpl[path]
+    try:
+        import cv2
+        tpl = cv2.imread(path)
+    except Exception as exc:                   # noqa: BLE001 - 失败=UNKNOWN
+        print(f"[FIGHT][warn] keep.png 加载失败：{type(exc).__name__}: {exc}",
+              flush=True)
+        tpl = None
+    _fight_tpl[path] = tpl
+    if tpl is None:
+        print(f"[FIGHT][warn] keep.png 不可用（{path}），捕获强信号保持 UNKNOWN",
+              flush=True)
+    return tpl
+
+
+def _fight_strong_capture(image, template_path: str):
+    """同帧 keep.png 强匹配分（只看 CAPTURE_POS_BOX 内的左上角）。
+
+    返回 0..1 的最高分；模板不可用/画面不可读返回 None = UNKNOWN。
+    阈值 0.95 由运行层判，位置框沿用现网 `CAPTURE_POS_BOX`，与
+    `patch_fish_captured` 的语义一致。
+    """
+    tpl = _fight_keep_template(template_path)
+    if tpl is None or image is None:
+        return None
+    try:
+        import cv2
+        hay = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+        th, tw = tpl.shape[:2]
+        if th > hay.shape[0] or tw > hay.shape[1]:
+            return 0.0
+        res = cv2.matchTemplate(hay, tpl, cv2.TM_CCOEFF_NORMED)
+        x1, y1, x2, y2 = CAPTURE_POS_BOX
+        x_end = min(x2 + 1, res.shape[1])
+        y_end = min(y2 + 1, res.shape[0])
+        if x_end <= x1 or y_end <= y1:
+            return 0.0
+        sub = res[y1:y_end, x1:x_end]
+        return 0.0 if sub.size == 0 else float(sub.max())
+    except Exception as exc:                   # noqa: BLE001 - UNKNOWN，不兜底
+        print(f"[FIGHT][warn] keep.png 匹配失败：{type(exc).__name__}: {exc}",
+              flush=True)
+        return None
+
+
+def _fight_frame_valid(image) -> bool:
+    """参考尺寸 + 非全黑；运行层在 start 之前问一次。"""
+    if image is None:
+        return False
+    try:
+        if tuple(image.size) != (TARGET_W, TARGET_H):
+            return False
+        arr = np.asarray(image.convert("L"))
+        return float(arr[::4, ::4].mean()) >= 1.0
+    except Exception:
+        return False
+
+
+def _fight_callbacks(player):
+    """按 player 构造注入回调；运行层只依赖这些 callable，不反向 import 适配器。"""
+    import pydirectinput as pdi
+
+    import autofish_fight_runtime as afr
+    import autofish_observation as aobs
+
+    def _foreground() -> bool:
+        try:
+            return ctypes.windll.user32.GetForegroundWindow() == game_hwnd()
+        except Exception:
+            return False
+
+    def _capture():
+        return capture_game()[0]
+
+    def _observe(image, foreground, monotonic_ts):
+        return aobs.observe_frame(
+            image,
+            foreground=foreground,
+            monotonic_ts=monotonic_ts,
+            wall_ts=time.time(),
+        )
+
+    def _sink(key: str, is_down: bool, reason: str):
+        # 新内核只拥有 f5/f6；其它键一律拒绝，避免和旧 owner 抢。
+        if key not in ("f5", "f6"):
+            raise ValueError(f"fight-fsm 不允许接管按键 {key!r}")
+        pdi.FAILSAFE = False
+        result = pdi.keyDown(key) if is_down else pdi.keyUp(key)
+        if result is False:
+            raise RuntimeError(f"pydirectinput 拒绝 {key} {'down' if is_down else 'up'}")
+        # 关键：成功后才同步旧账本，避免两条路径各记一份。
+        if key == "f5":
+            player.mouse_pressed = bool(is_down)
+        else:
+            _lift["held"] = bool(is_down)
+        print(f"[KEY] {key} {'按下' if is_down else '松开'} "
+              f"(fight-fsm:{reason})", flush=True)
+
+    def _net_action():
+        # 只按一次 F7；不 focus、不动 F6、不自动收网。
+        pdi.FAILSAFE = False
+        pdi.press(NET_KEY)
+        print(f"[patch] 新内核抄网：{NET_KEY} ×1（不自行确认收网）", flush=True)
+
+    def _friction_status():
+        return (
+            int(_fric["cur"]),
+            bool(_fric.get("calibrated")),
+            bool(_fric.get("_restored")),
+        )
+
+    def _commit_friction(target: int):
+        target = max(FRICTION_MIN, min(FRICTION_MAX, int(target)))   # 29 护栏
+        _fric["cur"] = target
+        _fric["t"] = time.time()
+        _fric["calibrated"] = True
+        _fric.pop("_restored", None)
+        friction_state.set(target, calibrated=True)
+        print(f"[patch] 新内核摩擦片 -> {target} 档（已落盘）", flush=True)
+
+    win: list = []
+
+    def _friction_step(level):
+        if level is None:
+            win.clear()                     # 冻结：清窗口，不喂控制器
+            friction_reset_observation(keep_last_action=True)
+            return
+        win.append((time.time(), int(level)))
+        friction_controller_step(win)
+
+    template_path = str(
+        Path(getattr(player.detection, "image_dir",
+                     Path(REF_DIR) / "static" / "en")) / "keep.png")
+    # 提前校验强结算模板：加载失败时运行层必须在 preflight 直接 BLOCKED，
+    # 绝不能先开始持键、再永远等不到捕获路径。
+    template_ok = _fight_keep_template(template_path) is not None
+    if not template_ok:
+        print(f"[FIGHT][error] 强结算模板不可用：{template_path}；"
+              f"新内核会话将在 preflight BLOCKED（不会按任何键）", flush=True)
+
+    def _preflight_error() -> str | None:
+        if not template_ok:
+            return f"capture_template_unavailable:{template_path}"
+        cfg = getattr(player, "cfg", None)
+        if cfg is not None:
+            if bool(getattr(getattr(cfg, "ARGS", None), "ELECTRO", False)):
+                return "unsupported_ELECTRO"
+            profile = getattr(cfg, "PROFILE", None)
+            mode = getattr(profile, "MODE", "")
+            if mode != "telescopic" and bool(
+                getattr(profile, "POST_ACCELERATION", False)
+            ):
+                return "unsupported_POST_ACCELERATION"
+        return None
+
+    return afr.FightCallbacks(
+        capture=_capture,
+        observe=_observe,
+        foreground=_foreground,
+        strong_capture=lambda image: _fight_strong_capture(image, template_path),
+        sink=_sink,
+        net_action=_net_action,
+        friction_status=_friction_status,
+        wheel_raw=_wheel_raw,
+        commit_friction=_commit_friction,
+        friction_step=_friction_step,
+        friction_begin=lambda: friction_reset_observation(keep_last_action=False),
+        clock=time.monotonic,
+        log=lambda text: print(text, flush=True),
+        frame_valid=_fight_frame_valid,
+        cancel=None,
+        preflight_error=_preflight_error,
+    )
+
+
+def patch_fight_runtime():
+    """在所有旧补丁之后安装新搏鱼内核；`RF4_FIGHT_FSM=1` 才生效。
+
+    默认关闭：不设置时只 import 纯运行层做开关判断，**不改任何 Player
+    方法**；`Player.pull_fish/retrieve_line/lift_fish` 保持旧实现，bot_ctl
+    也不需要改。
+    """
+    import autofish_fight_runtime as afr
+
+    enabled = afr.feature_enabled()
+    if not enabled:
+        print("[patch] 新搏鱼内核未启用（RF4_FIGHT_FSM=1 才启用，当前 legacy）",
+              flush=True)
+        return False
+
+    from rf4s import exceptions
+    from rf4s.controller.player import Player
+
+    ok = afr.install_player_patches(
+        Player,
+        enabled=True,
+        runtime_factory=lambda p: afr.FightRuntime(_fight_callbacks(p)),
+        captured_error=exceptions.FishCapturedError,
+        hooked_error=exceptions.FishHookedError,
+        lost_attr="_rf4_fight_lost",
+    )
+    if ok:
+        print("[patch] 新搏鱼内核已启用：Player.pull_fish/retrieve_line/lift_fish "
+              "已接管（F5/F6 单一 owner）", flush=True)
+    return ok
+
+
 def main():
     # 把自己的 PID 写下来，桌面开关靠它判断/停止（不依赖 wmic 查命令行）
     try:
@@ -2279,7 +2751,10 @@ def main():
         pass
 
     h = game_hwnd()
-    prepare_window(h)
+    prepared_size = prepare_window(h)
+    if prepared_size != (TARGET_W, TARGET_H):
+        restore_window(h)
+        raise RuntimeError(f"[patch] 客户区尺寸不匹配 {prepared_size}，禁止进入自动控制")
     suppress_ime_overlay()
     selfcheck()
 
@@ -2302,6 +2777,8 @@ def main():
     patch_key_watch()
     patch_single_rod(pag, pdi)
     patch_bottom_mode_held()
+    # ⚠️ 必须最后安装：新内核要盖住上面所有旧 patch 的 Player 入口。
+    patch_fight_runtime()
 
     # 验证合成后的虚拟桌面里游戏区域确实有内容
     vx, vy = _vorigin()

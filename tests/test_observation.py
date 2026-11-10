@@ -93,6 +93,44 @@ class TestRing(unittest.TestCase):
         self.assertEqual(ev["reason"], "non_reference_frame")
 
 
+class TestRingAdaptiveThreshold(unittest.TestCase):
+    """圆环判据必须自适应亮度（2026-11-05 实机：满环峰值 178 被判不可读）。"""
+
+    def _ring_at(self, gray_level, degrees=range(0, 360)):
+        a = np.full((H, W, 3), 40, dtype=np.uint8)
+        cx, cy = obs.LINE_RING_CENTER
+        for deg in degrees:
+            rad = math.radians(deg)
+            for r in range(11, 17):
+                x = int(round(cx + r * math.cos(rad)))
+                y = int(round(cy + r * math.sin(rad)))
+                a[y, x] = (gray_level, gray_level, gray_level)
+        return Image.fromarray(a, "RGB")
+
+    def test_dim_full_ring_still_reads_full(self):
+        """峰值 178（低于旧阈值 180）也必须读成接近满环，而不是"不可读"。"""
+        ratio, ev = obs.detect_ring(self._ring_at(178))
+        self.assertIsNotNone(ratio, ev)
+        self.assertGreaterEqual(ratio, 0.95)
+        self.assertEqual(ev["peak"], 178)
+
+    def test_dim_partial_ring_reports_partial(self):
+        ratio, _ = obs.detect_ring(self._ring_at(178, degrees=range(0, 180)))
+        self.assertIsNotNone(ratio)
+        self.assertAlmostEqual(ratio, 0.5, delta=0.08)
+
+    def test_flat_block_is_not_a_ring(self):
+        """均匀色块没有"环亮内圈暗"的结构，不能按峰值比例算成满环。"""
+        ratio, ev = obs.detect_ring(Image.new("RGB", (W, H), (60, 60, 60)))
+        self.assertIsNone(ratio)
+        self.assertEqual(ev["reason"], "icon_not_drawn")
+
+    def test_white_disk_is_not_a_ring(self):
+        ratio, ev = obs.detect_ring(Image.new("RGB", (W, H), (255, 255, 255)))
+        self.assertIsNone(ratio)
+        self.assertEqual(ev["reason"], "icon_not_drawn")
+
+
 # ---------------------------------------------------------------- 力度条
 
 

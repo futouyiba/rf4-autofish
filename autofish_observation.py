@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import enum
 import math
+import autofish_ring
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -177,7 +178,9 @@ BAR_HUE_YELLOWGREEN_MAX = 85
 # 半径 r13~15 是进度环，r10~12 是图标内圈（会带偏比例）。
 LINE_RING_CENTER = (1237, 1023)
 LINE_RING_RADII = (13, 15)
-LINE_RING_LIT = 180                # "亮"的灰度阈值
+LINE_RING_PEAK_MIN = autofish_ring.RING_PEAK_MIN   # 环上最亮都低于此值 = 图标没画
+LINE_RING_REL_LIT = autofish_ring.RING_REL_LIT     # 相对峰值点亮判据（自适应）
+LINE_RING_LIT = 180                # 已废弃：仅历史兼容，不再参与判定
 LINE_RING_DARK_MEAN = 20.0         # 区域内全黑 = HUD 没画出来
 LINE_RING_STEP_DEG = 3
 
@@ -449,53 +452,16 @@ def _bar(arr: np.ndarray) -> BarReading:
 
 
 def _ring(arr: np.ndarray) -> tuple[float | None, dict]:
-    cx, cy = LINE_RING_CENTER
-    r0, r1 = LINE_RING_RADII
-    ev = {
-        "center": [cx, cy],
-        "radii": [r0, r1],
-        "lit_min": LINE_RING_LIT,
-        "step_deg": LINE_RING_STEP_DEG,
-    }
-    if not _size_ok(arr):
-        ev["reason"] = "non_reference_frame"
-        return None, ev
+    """线杯圆环点亮比例；不可读返回 None。
 
-    gray = _gray(arr[cy - r1:cy + r1 + 1, cx - r1:cx + r1 + 1])
-    region_mean = float(gray.mean())
-    ev["region_mean"] = round(region_mean, 1)
-    if region_mean < LINE_RING_DARK_MEAN:
-        ev["reason"] = "hud_dark"
-        return None, ev
-
-    lit = 0
-    total = 0
-    peak = 0
-    for deg in range(0, 360, LINE_RING_STEP_DEG):
-        rad = math.radians(deg)
-        best = 0
-        for r in range(r0, r1 + 1):      # 环有 2~3px 厚，取该角度最亮的一圈
-            x = int(round(r * math.cos(rad)))
-            y = int(round(r * math.sin(rad)))
-            best = max(best, int(gray[r1 + y, r1 + x]))
-        peak = max(peak, best)
-        total += 1
-        if best >= LINE_RING_LIT:
-            lit += 1
-
-    ev["peak"] = peak
-    ev["lit"] = lit
-    ev["total"] = total
-    if peak < LINE_RING_LIT:
-        # 整圈最亮的角度都不够亮 = 这个图标根本没画出来（HUD 隐藏/被结算框盖住），
-        # 和"圆环真的空到 0%"是两回事。
-        ev["reason"] = "icon_not_drawn"
-        return None, ev
-
-    ratio = lit / total if total else None
-    ev["ratio"] = None if ratio is None else round(ratio, 3)
-    return ratio, ev
-
+    判定复用 `autofish_ring.measure_ring()`：按当前帧峰值自适应亮度。
+    固定 180 阈值在夜间会把满环误判成"图标没画"（2026-11-05 实机证据：
+    线杯环峰值 178 < 180 → 整圈判不可读，临岸/收网判断全部失去输入）。
+    """
+    return autofish_ring.measure_ring(
+        arr, LINE_RING_CENTER, LINE_RING_RADII,
+        peak_min=LINE_RING_PEAK_MIN, rel_lit=LINE_RING_REL_LIT,
+        step_deg=LINE_RING_STEP_DEG, dark_mean=LINE_RING_DARK_MEAN)
 
 def _ok_modal(arr: np.ndarray) -> tuple[TriState, dict]:
     """「确定」按钮：上下 + 左右边框 + 框内外亮度对比。
