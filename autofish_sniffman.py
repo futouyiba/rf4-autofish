@@ -154,16 +154,21 @@ def _elevated_spawn(args: list) -> bool:
     return bool(ok)
 
 
-def start_sniff(quiet: bool = False) -> int:
+def start_sniff(quiet: bool = False, headless: bool = False) -> int:
     """入口：``--sniff-ctl start``。返回进程退出码（sniff 是常驻，正常不返回）。
 
     幂等：已在跑就直接报状态返回 0。
+    ``headless=True`` 给 UI 用：不弹 MessageBox，改为返回码 + 一行说明
+    （UI 自己展示"未安装 Npcap，点安装指引"）。
     """
     running = sniff_running()
     if running["alive"]:
         print("抓包器已在运行 (pid=%d)" % running["pid"])
         return 0
     if not npcap_available():
+        if headless:
+            print("npcap_missing")
+            return 2
         _guide_install()
         return 2
     args = ["--sniff", "--quiet"]
@@ -249,6 +254,25 @@ def run_sniff_forever() -> int:
             sys.stdout = old
     app_paths.data_path("_sniff", "sniff.process.json").unlink(missing_ok=True)
     return rc
+
+
+def open_npcap_page() -> bool:
+    """打开 Npcap 官方下载页（UI 安装指引按钮用）。"""
+    try:
+        os.startfile(NPCAP_URL)  # noqa: S606 - 官方下载页
+        return True
+    except OSError:
+        return False
+
+
+def sniff_summary() -> dict:
+    """给 UI 的一行状态：{npcap, running, pid}。轻量、无副作用。"""
+    running = sniff_running()
+    return {
+        "npcap": npcap_available(),
+        "running": running["alive"],
+        "pid": running["pid"] if running["alive"] else None,
+    }
 
 
 def _guide_install() -> None:

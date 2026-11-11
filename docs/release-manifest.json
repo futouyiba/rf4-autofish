@@ -99,7 +99,7 @@
     },
     {
       "path": "autofish_ui.py",
-      "sha256": "1bf8232da171e7b76556a8d71b9e4434fe2bbeef46f9460ce3d0d2a6e251822a"
+      "sha256": "7c1e01edb9e8fee770ef553554002d329fc54cc3b12e4ab9bec2ecc2893d93ab"
     },
     {
       "path": "bot_ctl.py",
@@ -295,7 +295,7 @@
     },
     {
       "path": "docs/exe-guide.md",
-      "sha256": "db1b0347ebc1f3afd5306cd5cc007d77906e250b20219ab7fc5c91e66f62f675"
+      "sha256": "996fc50e8fd2a451aa3572ceef464c42518b78e1e05f43370edbc834d6968ba3"
     },
     {
       "path": "tests/test_app_paths.py",

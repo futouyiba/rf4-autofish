@@ -36,7 +36,9 @@ import autofish_hotkeys as hotkeys
 from autofish_ipc import RuntimeClient
 
 PANEL_WIDTH = 320
-PANEL_HEIGHT = 640
+# 2026-11-11 加了协议层一行状态 + 两个按钮（640 会截掉底部按钮）。
+# 16 行状态 + 10 个按钮（5 行 × 2）+ 协议层行 + footer。
+PANEL_HEIGHT = 760
 PANEL_MARGIN = 8
 POLL_INTERVAL = 0.5
 CUR_MAX = 29
@@ -848,6 +850,9 @@ class ButtonStates:
     confirm_ready: bool
     confirm_net_retracted: bool
     emergency_stop: bool
+    # 协议层不依赖钓鱼状态机，恒可用（安装指引按钮由探测结果单独控制）
+    sniff_toggle: bool = True
+    sniff_install: bool = True
 
 
 def button_states(
@@ -1518,6 +1523,7 @@ class AutoFishPanel:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_output)
         self.root.after(250, self._layout_tick)
+        self.root.after(800, self._sniff_probe)
         self._apply_follow()
         self._apply_view(
             build_view({}, {"ok": False, "message": "等待后台状态…"})
@@ -1530,7 +1536,7 @@ class AutoFishPanel:
         root.title("RF4 自动钓鱼")
         root.configure(bg=self.BG)
         root.geometry(_geometry_string(PANEL_WIDTH, PANEL_HEIGHT, 120, 120))
-        root.minsize(PANEL_WIDTH, 560)
+        root.minsize(PANEL_WIDTH, 620)
         root.resizable(False, True)
 
         header = tk.Frame(root, bg=self.BG, padx=10, pady=3)
@@ -1658,6 +1664,8 @@ class AutoFishPanel:
                 "我已手动收网",
                 lambda: self._send_command("confirm_net_retracted"),
             ),
+            ("sniff_toggle", "协议层：检测…", self._on_sniff_toggle),
+            ("sniff_install", "安装指引(Npcap)", self._on_sniff_install),
             ("emergency_stop", "紧急停止", self._emergency_stop),
         )
         for index, (name, text, command) in enumerate(specs):
@@ -1684,6 +1692,21 @@ class AutoFishPanel:
                 pady=1,
             )
             self._buttons[name] = button
+
+        # 协议层状态行（不是钓鱼状态机的一部分；由本进程直接探测）
+        self.sniff_var = tk.StringVar(value="协议层：检测中…")
+        tk.Label(
+            root,
+            textvariable=self.sniff_var,
+            bg=self.BG,
+            fg=self.MUTED,
+            font=("Microsoft YaHei UI", 12),
+            anchor="w",
+            justify="left",
+            wraplength=300,
+            padx=10,
+            pady=0,
+        ).pack(fill="x")
 
         footer = tk.Frame(root, bg=self.BG, padx=10, pady=0)
         footer.pack(fill="x")
@@ -2148,6 +2171,88 @@ class AutoFishPanel:
             place_panel_noactivate(self._own_hwnd, show=True, topmost=True)
 
     # -- follow / drag --------------------------------------------------
+    # ------------------------------------------------------------------
+    # 协议层（可选增强）：探测 + 启停 + 安装指引
+    # ------------------------------------------------------------------
+    def _sniff_probe(self) -> None:
+        """每 5 秒探测一次协议层状态，刷新状态行与按钮文案。"""
+        if self._closing:
+            return
+        try:
+            import autofish_sniffman  # noqa: PLC0415
+
+            info = autofish_sniffman.sniff_summary()
+        except Exception as exc:  # noqa: BLE001 - 协议层显示失败不影响面板
+            self.sniff_var.set("协议层：探测失败（%s）" % type(exc).__name__)
+        else:
+            npcap = bool(info.get("npcap"))
+            running = bool(info.get("running"))
+            pid = info.get("pid")
+            if running:
+                text = "协议层：运行中 (pid=%s) · 夜间也稳" % pid
+            elif npcap:
+                text = "协议层：未运行 · 纯视觉（夜间弱）"
+            else:
+                text = "协议层：未安装 Npcap · 纯视觉（夜间弱）"
+            self.sniff_var.set(text)
+            toggle = self._buttons.get("sniff_toggle")
+            if toggle is not None:
+                toggle.config(
+                    text="停止协议层" if running else "启动协议层",
+                )
+            install = self._buttons.get("sniff_install")
+            if install is not None:
+                install.config(text="安装指引(Npcap)" if not npcap else "已装 Npcap")
+                install.config(state=("normal" if not npcap else "disabled"))
+        self.root.after(5000, self._sniff_probe)
+
+    def _on_sniff_toggle(self) -> None:
+        """启动/停止协议层抓包（子线程执行，避免提权弹窗卡住 UI）。"""
+        import threading  # noqa: PLC0415
+
+        def work() -> None:
+            try:
+                import autofish_sniffman  # noqa: PLC0415
+
+                info = autofish_sniffman.sniff_summary()
+                if info.get("running"):
+                    rc = autofish_sniffman.stop_sniff()
+                    msg = "协议层已停止" if rc == 0 else "停止失败（rc=%s）" % rc
+                else:
+                    rc = autofish_sniffman.start_sniff(headless=True)
+                    if rc == 2:
+                        msg = "未装 Npcap：点「安装指引」装一次（勾 WinPcap 兼容）"
+                    elif rc == 3:
+                        msg = "提权被拒绝（UAC 点了否）"
+                    else:
+                        msg = "已请求启动（弹 UAC 确认）；先抓包后登录游戏"
+            except Exception as exc:  # noqa: BLE001
+                msg = "协议层操作失败：%s" % type(exc).__name__
+            self._output.put(("notice", msg))
+
+        self._set_ack("协议层：操作中…")
+        threading.Thread(target=work, daemon=True).start()
+        # 稍等再探测，让身份文件就位
+        self.root.after(1500, lambda: self._sniff_probe_now())
+
+    def _sniff_probe_now(self) -> None:
+        # 复用 _sniff_probe 的逻辑但立即执行（按钮反馈用）
+        self._sniff_probe()
+
+    def _on_sniff_install(self) -> None:
+        """打开 Npcap 官方下载页。"""
+        try:
+            import autofish_sniffman  # noqa: PLC0415
+
+            ok = autofish_sniffman.open_npcap_page()
+        except Exception:  # noqa: BLE001
+            ok = False
+        msg = (
+            "已打开下载页：装时勾选 WinPcap API 兼容，装完点「启动协议层」"
+            if ok else "打开失败，请手动访问 https://npcap.com/dist/"
+        )
+        self._set_ack(msg)
+
     def _on_follow_toggle(self) -> None:
         self._following = bool(self.follow_var.get())
         if self._following:
