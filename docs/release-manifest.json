@@ -27,7 +27,7 @@
     },
     {
       "path": "autofish_friction_window.py",
-      "sha256": "60b9310dde89137de99b950cc76f7036e05c2885593b929a79dfa177912426cd"
+      "sha256": "5ef6ffd3a716b8dbae439490e1b088815fe4e5da31d4c5c7ef38fbba72430160"
     },
     {
       "path": "autofish_handoff.py",
@@ -47,7 +47,7 @@
     },
     {
       "path": "autofish_lifecycle.py",
-      "sha256": "03b40988dbb25ec737cb0eaecb7d4f64bf9915d9c9c7e6558c59bd246af02467"
+      "sha256": "a78fecec8c33d722a189b4efef59420a5ff305c5fd3a968c953a9b36f89110b2"
     },
     {
       "path": "autofish_nav.py",
@@ -127,7 +127,7 @@
     },
     {
       "path": "rf4s_adapter.py",
-      "sha256": "d52ff13c577ccd5b5cccb84bdfde740332e7a774051cca7dff20f0128892363e"
+      "sha256": "84de7f0bd5e2577e810c88b2ebf717410526418a001401a818692940406129ae"
     },
     {
       "path": "static/ready_cn.png",
@@ -135,7 +135,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "214268e17860ab20f2dbb2bb11428a637a2c2120f958d0697416402642f73f75"
+      "sha256": "84187cc1d00c02a25270a47cca8d4e0721b6a4f64ec9e9307522cb1ec0495ec0"
     },
     {
       "path": "docs/chinese-reference-review.md",
@@ -195,7 +195,7 @@
     },
     {
       "path": "tests/test_friction_window.py",
-      "sha256": "8abdb4596991e3ce0e1fd31818fc3d29f1947b83d03684ef2c498ac94cee3897"
+      "sha256": "bbe1b1c84f90b4ef590476b63ddd0ec7cde89eb670652e9bcd40f2ef1e099999"
     },
     {
       "path": "tests/test_fullflow_runtime.py",
@@ -219,7 +219,7 @@
     },
     {
       "path": "tests/test_lifecycle.py",
-      "sha256": "7d805ca6ef28d096245b8d20d9c72ead2b21f8e24a64018344129ecd33b22b56"
+      "sha256": "3c3538b1cb637318066890af33c8229cc79068a23c66454746d77885b77e4093"
     },
     {
       "path": "tests/test_live_startup_regressions.py",
@@ -295,7 +295,7 @@
     },
     {
       "path": "docs/exe-guide.md",
-      "sha256": "e198e0488f1a1aec2ccd1ff37edb7ad1483f52054669067209d3e9b3f881b1f5"
+      "sha256": "c8ab7d8de9905a29ad16fd041972b8f0b17889175c7ff6f145f269f7da291f5e"
     },
     {
       "path": "tests/test_app_paths.py",
