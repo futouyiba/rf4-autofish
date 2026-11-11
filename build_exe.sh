@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# 一键构建 Windows 绿色版：构建 onedir 包，再压成可直接分发的 zip。
+# 一键构建 Windows 绿色版。
 #
-#   cd bot && bash build_exe.sh            # 正式版
-#   cd bot && SKIP_ZIP=1 bash build_exe.sh # 只构建不压缩（调试用）
+#   cd bot && bash build_exe.sh              # 正式版（onedir + zip，推荐）
+#   cd bot && bash build_exe.sh --onefile    # 单文件 exe（只剩一个文件）
+#   cd bot && SKIP_ZIP=1 bash build_exe.sh   # 只构建不压缩（调试用）
+#
+# onefile 与 onedir 的区别：onefile 每次启动都要把 ~215MB 解包到 %TEMP%，
+# 冷启动慢 5~15 秒，但分发时只有一个文件；onedir 只解一次，日常用更快。
 #
 # 前置：refs/RussianFishing4Script/.venv 已存在（RF4S 运行时依赖都在里面）。
 # 产物：dist/RF4AutoFish/RF4AutoFish.exe  +  dist/RF4AutoFish-vX.Y.Z-win64.zip
@@ -26,11 +30,38 @@ if ! "$PY" -c "import PyInstaller" >/dev/null 2>&1; then
 fi
 
 VER="$("$PY" -c "import app_paths; print(app_paths.APP_VERSION)")"
-echo "== 构建 RF4AutoFish $VER =="
-"$PY" -m PyInstaller --noconfirm --clean --distpath dist --workpath build rf4autofish.spec
+
+ONEFILE=0
+for arg in "$@"; do
+    case "$arg" in
+        --onefile) ONEFILE=1 ;;
+        *) echo "未知参数: $arg" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$ONEFILE" = "1" ]; then
+    export RF4_ONEFILE=1
+    DIST="dist-onefile"
+    echo "== 构建 RF4AutoFish $VER（单文件）=="
+else
+    unset RF4_ONEFILE || true
+    DIST="dist"
+    echo "== 构建 RF4AutoFish $VER（onedir）=="
+fi
+"$PY" -m PyInstaller --noconfirm --clean --distpath "$DIST" --workpath build rf4autofish.spec
 
 echo "== 自检（开发态）=="
 "$PY" app_main.py --selftest
+
+if [ "$ONEFILE" = "1" ]; then
+    SRC="$DIST/RF4AutoFish.exe"
+    OUT="dist/RF4AutoFish-v${VER}-win64-single.exe"
+    mkdir -p dist
+    cp -f "$SRC" "$OUT"
+    ls -la "$OUT"
+    echo "完成：$OUT（单文件，直接双击）"
+    exit 0
+fi
 
 if [ "${SKIP_ZIP:-0}" = "1" ]; then
     echo "跳过压缩（SKIP_ZIP=1）"

@@ -20,6 +20,12 @@ D:\RF4AutoFish\
 └─ _internal\          ← 依赖与模板，整个目录都要在
 ```
 
+> **想要"只有一个文件"？** Release 里同时提供
+> `RF4AutoFish-vX.Y.Z-win64-single.exe`（约 94 MB，双击即用，无需任何附属文件）。
+> 代价：每次启动都要把约 204 MB 解包到 `%TEMP%`，冷启动慢 4~15 秒；面板和后台
+> 同时跑时会各占一份（合计约 400 MB 临时空间），退出后自动清理（**被强杀会残留
+> `%TEMP%\_MEIxxxx`，手动删掉即可**）。日常用推荐 onedir 的 zip 包，图省事再选单文件。
+
 > 解压后如果杀毒软件报「未知程序」，是 PyInstaller 打包的常见误报，
 > 加信任即可；也可以按 [第 10 节](#10-从源码自己打包) 自己构建。
 
@@ -201,13 +207,25 @@ D:\RF4AutoFish\
 
 ```bash
 cd bot
-bash build_exe.sh          # 装 PyInstaller（缺的话）→ 构建 → 打 zip
-ls dist/RF4AutoFish-v1.0.0-win64.zip
+bash build_exe.sh            # onedir + zip（日常用）
+bash build_exe.sh --onefile  # 单文件 exe（分发方便）
+ls dist/RF4AutoFish-v1.0.0-win64.zip          # onedir 包
+ls dist/RF4AutoFish-v1.0.0-win64-single.exe   # 单文件
 ```
 
-构建脚本做的事：调 `PyInstaller rf4autofish.spec`（onedir），
-再把 `dist/RF4AutoFish/` 压成 zip。spec 里已经把 `rf4s` 快照、`static/` 模板、
-`config.yaml` 一并收进去，不需要额外的 `vendor/` 目录。
+构建脚本做的事：调 `PyInstaller rf4autofish.spec`，再把 `dist/RF4AutoFish/`
+压成 zip（`--onefile` 时跳过压缩，直接产出单个 exe）。spec 里已经把 `rf4s`
+快照、`static/` 模板、`config.yaml` 一并收进去，不需要额外的 `vendor/` 目录。
+
+两种产物的取舍（同一个 spec，靠 `RF4_ONEFILE=1` 切换）：
+
+| | onedir（zip） | onefile（单 exe） |
+|---|---|---|
+| 分发形态 | exe + `_internal/` 整个目录 | 一个 94 MB 文件 |
+| 冷启动 | 快（直接进） | 慢 4~15 秒（先解包到 `%TEMP%`） |
+| 临时空间 | 无 | 每进程约 204 MB，退出自动清 |
+| 面板+后台同时跑 | 共用一份依赖 | 各解一份，合计约 400 MB |
+| 杀软误报概率 | 中 | 偏高（单文件自解包更可疑） |
 
 ---
 

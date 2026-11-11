@@ -279,11 +279,11 @@
     },
     {
       "path": "rf4autofish.spec",
-      "sha256": "52fcf59d0b77dcd8b2b3d259f86bec7fcc6daa36caa5c102cb2326587cdc8da0"
+      "sha256": "f35799f6123813041f8d4ea220ab3b311a5de4bc2cf6b595a5bb3694977c298a"
     },
     {
       "path": "build_exe.sh",
-      "sha256": "ac54089e4bb23931649eb3738008d61c3acc211a6bad5915973f766b27336ae6"
+      "sha256": "bc250193bc58fd95c7b3ac5336ba21bd8b9ff545ab677413d924e67692ae2d6d"
     },
     {
       "path": "assets/rf4autofish.ico",
@@ -295,7 +295,7 @@
     },
     {
       "path": "docs/exe-guide.md",
-      "sha256": "c8ab7d8de9905a29ad16fd041972b8f0b17889175c7ff6f145f269f7da291f5e"
+      "sha256": "86114c37ba0ee043454e7e209d589539c5d7b8e366c649ab53e395873353ce63"
     },
     {
       "path": "tests/test_app_paths.py",

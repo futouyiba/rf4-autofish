@@ -13,8 +13,10 @@
 
 设计要点
 --------
-* **onedir 而不是 onefile**：面板要拉起后台子进程（``--bot``），onefile 会让
-  父子进程各自解包一份（启动慢、临时目录翻倍）。onedir 只解一次。
+* **默认 onedir**：面板要拉起后台子进程（``--bot``）。onedir 只解包一次，
+  冷启动快；onefile 每次启动都要把 ~215MB 解到 %TEMP%，慢 5~15 秒，但只有
+  一个文件、拷起来干净。想打单文件就设 ``RF4_ONEFILE=1``（见 build_exe.sh
+  ``--onefile``），spec 会切成 EXE+datas 的单文件模式。
 * ``rf4s`` 用 ``collect_submodules`` 全收：它内部大量按字符串动态导入
   controller/component，漏一个就是运行期 ImportError。
 * ``static/`` 与 ``config.yaml`` 放在 ``_internal`` 根：上游 RF4S 用
@@ -127,12 +129,33 @@ exe = EXE(
     icon=str(BOT / "assets" / "rf4autofish.ico"),
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="RF4AutoFish",
-)
+if os.environ.get("RF4_ONEFILE") == "1":
+    # 单文件：依赖/资源全部塞进 EXE，运行时解到 sys._MEIPASS。
+    # app_paths 已经按 _MEIPASS 解析只读资源，datas 的相对位置不用改。
+    exe_onefile = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        name="RF4AutoFish",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        runtime_tmpdir=None,
+        console=False,
+        disable_windowed_traceback=False,
+        icon=str(BOT / "assets" / "rf4autofish.ico"),
+    )
+
+else:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name="RF4AutoFish",
+    )
