@@ -6,6 +6,9 @@
 * （无参数 / ``--ui``）  右侧吸附控制面板（``autofish_ui``）
 * ``--bot``             钓鱼主循环（``autofish_bridge``），由面板经 bot_ctl 拉起
 * ``--ctl <action>``    ``bot_ctl`` 的命令行动作（start/stop/status/...）
+* ``--sniff``           协议抓包进程本体（需要管理员；由 sniffman 提权拉起）
+* ``--sniff-ctl <action>`` 抓包器管理：start/stop/status（检测 Npcap、引导安装、提权拉起）
+* ``--sniff-kill <pid>`` 提权后的自杀通道（内部使用）
 * ``--selftest``        打包自检：只导入、不碰游戏
 * ``--version``         版本号
 
@@ -101,6 +104,8 @@ def _selftest() -> int:
         ("local: rf4_sniff", "rf4_sniff"),
         ("local: autofish_nav", "autofish_nav"),
         ("local: autofish_ocr_client", "autofish_ocr_client"),
+        ("local: autofish_sniffman", "autofish_sniffman"),
+        ("scapy (协议层)", "scapy.all"),
     ]
     for label, module in checks:
         try:
@@ -164,6 +169,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run_bot(rest)
     if head == "--ctl":
         return _run_ctl(rest)
+    if head == "--sniff":
+        import autofish_sniffman  # noqa: PLC0415
+
+        return autofish_sniffman.run_sniff_forever()
+    if head == "--sniff-ctl":
+        import autofish_sniffman  # noqa: PLC0415
+
+        action = rest[0] if rest else "status"
+        if action == "start":
+            return autofish_sniffman.start_sniff()
+        if action == "stop":
+            return autofish_sniffman.stop_sniff()
+        if action == "status":
+            return autofish_sniffman.status_sniff()
+        print("未知 sniff-ctl 动作: %s（可用：start/stop/status）" % action,
+              file=sys.stderr)
+        return 2
+    if head == "--sniff-kill":
+        import autofish_sniffman  # noqa: PLC0415
+
+        return autofish_sniffman.kill_by_pid(rest[0] if rest else "")
     if head in ("--ui", "-u"):
         return _run_panel(rest)
     if head in ("-h", "--help"):

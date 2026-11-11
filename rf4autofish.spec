@@ -71,6 +71,11 @@ hiddenimports = [
     # autofish_hotkeys 的兜底后端 / 截图备用后端，按字符串导入
     "keyboard",
     "mss",
+    # 协议抓包（--sniff）：scapy 由 PyInstaller hook 收集，这里显式列关键层
+    "scapy",
+    "scapy.all",
+    "scapy.layers.inet",
+    "scapy.sendrecv",
     # matplotlib 只被 rf4s 的 timer 用来画统计图，默认 Agg 后端
     "matplotlib.backends.backend_agg",
 ]
