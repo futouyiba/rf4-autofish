@@ -19,17 +19,27 @@
 
 ## 下载即用（Windows 绿色版）
 
-不想碰 Python 的话，直接去 [Releases](../../releases) 下载 `RF4AutoFish-vX.Y.Z-win64.zip`：
+不想碰 Python 的话，直接去 [Releases](../../releases) 取现成包，两种形态任选：
 
-1. 解压到**不含中文/空格**的目录（`_internal` 要和 exe 同级，别只拿 exe 走）。
-2. **先开游戏**，站到水边、看到「钓具准备好…」。
-3. 双击 `RF4AutoFish.exe` → 面板自动吸附在游戏窗口右侧。
-4. 点「启动后台（离线时）」→ 状态变 `PROBING`；再点「开始/恢复自动」（或 `Ctrl+Alt+Shift+F7`）→ 开钓。
+| 产物 | 适合 | 说明 |
+|---|---|---|
+| `RF4AutoFish-vX.Y.Z-win64-single.exe` | **发给别人 / 图省事** | 一个 94 MB 文件，双击即用；冷启动慢 5~15 秒 |
+| `RF4AutoFish-vX.Y.Z-win64.zip` | 自己长期用 | 解压后 ~215 MB，启动快、临时空间不翻倍 |
 
-> **包内自带**：面板（tkinter）+ 全部依赖（numpy/opencv/pywin32/…），不需要装 Python。
-> **包外可选**：抓包器（Npcap + 管理员，装上才走协议判据，夜间更稳）、
-> `venv-ocr`（只有读坐标/读鱼护数才要）。取舍见
-> [`docs/exe-guide.md`](docs/exe-guide.md) 第 1、7、8 节。
+**单文件版**（推荐发给别人）：
+
+1. 双击 exe（首次启动会解包，等 5~15 秒），面板自动贴到游戏窗口右侧。
+2. 点「启动后台（离线时）」→ `PROBING`；再点「开始/恢复自动」→ 开钓。
+
+**zip 版**：解压到不含中文/空格的目录（`_internal` 必须和 exe 同级，别只拿 exe 走），
+之后步骤同上。
+
+> 两版都自带面板（tkinter）和全部依赖，**不需要装 Python**。
+> 抓包器（Npcap + 管理员）与 `venv-ocr` 都是可选增强，普通钓鱼用不到。
+
+- 一页纸速查（发给别人时一起给）：**[docs/QUICKSTART.txt](docs/QUICKSTART.txt)**
+- 完整使用指南（能做什么/不能做什么、面板字段、状态对照、卡住怎么办）：
+  **[docs/exe-guide.md](docs/exe-guide.md)**
 
 ```
 ┌──────────────────────┬───────────┐
@@ -45,7 +55,7 @@
 
 * 面板只是遥控器，**关掉面板不会停掉钓鱼**；要停点「立即停止」，要杀进程点「紧急停止」。
 * 运行数据（日志/端点/pid）都在 `%LOCALAPPDATA%\RF4AutoFish\`。
-* 完整字段说明、热键表、故障排查、自己打包：**[docs/exe-guide.md](docs/exe-guide.md)**。
+* 官方热键是 `Ctrl+Alt+Shift+F6/F7/F8/F9/F10`，详见使用指南第 4 节。
 
 > 同一个 exe 也是命令行工具：`RF4AutoFish.exe --selftest` 自检，
 > `--ctl status|start|stop` 管后台，`--bot` 直接跑主循环。

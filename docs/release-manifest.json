@@ -135,7 +135,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "84187cc1d00c02a25270a47cca8d4e0721b6a4f64ec9e9307522cb1ec0495ec0"
+      "sha256": "289c757e32fe8897310aaaf2b382f08270c6404fc1f82532a8001be9095e1fc4"
     },
     {
       "path": "docs/chinese-reference-review.md",
@@ -295,7 +295,7 @@
     },
     {
       "path": "docs/exe-guide.md",
-      "sha256": "86114c37ba0ee043454e7e209d589539c5d7b8e366c649ab53e395873353ce63"
+      "sha256": "36507fd117776e7eb01a33e7b2346167b4bfd354863da022e66b41d027dd5d6e"
     },
     {
       "path": "tests/test_app_paths.py",
