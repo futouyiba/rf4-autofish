@@ -133,14 +133,31 @@ def registration_supported(demo: bool = False) -> bool:
     return not demo and os.name == "nt"
 
 
+# 面板顶部统一声明一次前缀；按钮里只标 F 键，避免每个按钮重复 17 个字符。
+# 「勿单按」是防误操作提示：游戏里单按 F7 是抄网键。
+# 两行都控制在标签 wraplength=300 内，不会折成三行。
+HOTKEY_LEGEND = "热键前缀 Ctrl+Alt+Shift（勿单按 F 键）"
+HOTKEY_KEYS_LINE = "F6启动/F7恢复/F8观察/F9收尾/F10停止"
+
+
 def with_hotkey_label(name: str, text: str) -> str:
-    """Append the bare key name to a button caption (e.g. ``恢复自动 F7``)."""
+    """按钮只标裸 F 键，如 ``恢复自动 (F7)``。
+
+    面板宽 320px、按钮两列，每列文字只有约 144px；把完整的
+    ``Ctrl+Alt+Shift+F7`` 拼进每个按钮会被裁断。前缀由顶部
+    :func:`format_report` 统一声明一次，那里同时写明「勿单按」，
+    避免用户在游戏里单按 F7（那是抄网键）造成误操作。
+    """
     key = HOTKEY_KEYS.get(str(name))
-    return "%s %s" % (text, key) if key else str(text)
+    return "%s (%s)" % (text, key) if key else str(text)
 
 
 def format_report(report: Any) -> str:
-    """One-line sidebar summary of every registration attempt."""
+    """Sidebar summary of every registration attempt.
+
+    前缀只写一次：按钮标签里是裸 F 键，靠这行说明它们都要配上
+    ``Ctrl+Alt+Shift``，且不能单按。
+    """
     if not isinstance(report, Mapping):
         return "热键：—"
     if not report.get("enabled"):
@@ -149,11 +166,17 @@ def format_report(report: Any) -> str:
     items = report.get("items")
     if not isinstance(items, (list, tuple)) or not items:
         return "热键：未注册"
+    ok_count = sum(
+        1 for item in items
+        if isinstance(item, Mapping) and item.get("ok"))
+    if ok_count == len(items):
+        return HOTKEY_LEGEND + "\n" + HOTKEY_KEYS_LINE
     parts: List[str] = []
     for item in items:
         if not isinstance(item, Mapping):
             continue
-        key = str(item.get("key") or item.get("name") or "?")
+        name = str(item.get("name") or item.get("key") or "?")
+        key = HOTKEY_KEYS.get(name) or str(item.get("key") or name)
         if item.get("ok"):
             parts.append("%s成功" % key)
             continue
@@ -164,7 +187,7 @@ def format_report(report: Any) -> str:
             parts.append("%s失败(%s)" % (key, error))
         else:
             parts.append("%s失败" % key)
-    return "热键：" + " ".join(parts) if parts else "热键：未注册"
+    return HOTKEY_LEGEND + " " + " ".join(parts) if parts else "热键：未注册"
 
 
 def resume_combo_down(api: "Win32HotkeyApi") -> bool:

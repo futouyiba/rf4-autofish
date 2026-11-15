@@ -1649,13 +1649,13 @@ class AutoFishPanel:
             buttons.grid_columnconfigure(column, weight=1)
 
         specs = (
-            ("start_background", "启动后台（离线时）", self._start_background),
-            ("resume", "开始/恢复自动", lambda: self._send_command("resume")),
+            ("start_background", "启动后台·离线", self._start_background),
+            ("resume", "开始/恢复", lambda: self._send_command("resume")),
             ("observe", "仅观察", lambda: self._send_command("observe")),
             ("stop", "立即停止", lambda: self._send_command("stop")),
             (
                 "stop_after_fish",
-                "本条结束后停",
+                "本条后停",
                 lambda: self._send_command("stop_after_fish"),
             ),
             ("confirm_ready", "确认钓具就绪", lambda: self._send_command("confirm_ready")),

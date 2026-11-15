@@ -210,10 +210,26 @@ class DefinitionTests(unittest.TestCase):
         ids = [binding.hotkey_id for binding in hk.HOTKEY_BINDINGS]
         self.assertEqual(len(ids), len(set(ids)))
 
-    def test_button_labels_include_the_key(self) -> None:
-        self.assertEqual(hk.with_hotkey_label("resume", "恢复自动"), "恢复自动 F7")
-        self.assertEqual(hk.with_hotkey_label("stop", "立即停止"), "立即停止 F10")
+    def test_button_labels_include_only_the_bare_key(self) -> None:
+        # 面板每列仅约 144px，全称 Ctrl+Alt+Shift+F7 会被裁断；
+        # 前缀由顶部 format_report 统一声明，按钮只标裸 F 键。
+        self.assertEqual(hk.with_hotkey_label("resume", "恢复自动"), "恢复自动 (F7)")
+        self.assertEqual(hk.with_hotkey_label("stop", "立即停止"), "立即停止 (F10)")
         self.assertEqual(hk.with_hotkey_label("confirm_ready", "确认"), "确认")
+        for binding in hk.HOTKEY_BINDINGS:
+            with self.subTest(binding=binding.name):
+                self.assertNotIn("Ctrl", hk.with_hotkey_label(binding.name, "按钮"))
+
+    def test_report_declares_the_shared_prefix_once(self) -> None:
+        text = hk.format_report({
+            "enabled": True,
+            "items": [{"key": k, "ok": True}
+                      for k in ("F6", "F7", "F8", "F9", "F10")],
+        })
+        self.assertEqual(text.count("Ctrl+Alt+Shift"), 1)
+        self.assertIn("勿单按", text)
+        self.assertIn("F10停止", text)
+        self.assertEqual(len(text.splitlines()), 2)
 
     def test_report_shows_success_and_conflict(self) -> None:
         text = hk.format_report(
