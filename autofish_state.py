@@ -1,4 +1,4 @@
-"""RF4 自动钓鱼 —— 纯 shadow 状态推断（阶段 1，零输入、零抓帧）。
+"""国钓斧头助手 —— 纯 shadow 状态推断（阶段 1，零输入、零抓帧）。
 
 输入只有 `autofish_observation.Observation`（同一帧的全部可读事实）加一个
 **动作上下文**（`source`，例如 wait_bite / pull / lift），输出只有一份

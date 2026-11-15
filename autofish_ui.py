@@ -1533,7 +1533,7 @@ class AutoFishPanel:
     def _build(self) -> None:
         tk = self.tk
         root = self.root
-        root.title("RF4 自动钓鱼")
+        root.title("国钓斧头助手")
         root.configure(bg=self.BG)
         root.geometry(_geometry_string(PANEL_WIDTH, PANEL_HEIGHT, 120, 120))
         root.minsize(PANEL_WIDTH, 620)
@@ -1543,7 +1543,7 @@ class AutoFishPanel:
         header.pack(fill="x")
         title = tk.Label(
             header,
-            text="RF4 自动钓鱼",
+            text="国钓斧头助手",
             bg=self.BG,
             fg=self.FG,
             font=("Microsoft YaHei UI", 14, "bold"),

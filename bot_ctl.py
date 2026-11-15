@@ -637,7 +637,7 @@ def start(legacy: bool = False) -> int:
     kind = "legacy" if legacy else "bridge"
     log_path = LOG_LEGACY if legacy else LOG_BRIDGE
     print("=" * 56)
-    print("  自动钓鱼启动中（%s）..." % kind)
+    print("  国钓斧头助手启动中（%s）..." % kind)
     print("  停止：python bot_ctl.py stop，或 emergency-stop")
     print("=" * 56)
     try:

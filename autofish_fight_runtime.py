@@ -1,4 +1,4 @@
-"""RF4 自动钓鱼 —— 新搏鱼内核的 feature-flag 运行层。
+"""国钓斧头助手 —— 新搏鱼内核的 feature-flag 运行层。
 
 本模块把 `FightMachine` / `InputArbiter` / 同帧观测接到真实流程上，但**不
 import 适配器**：所有会产生副作用的东西（抓帧、前台判断、按键、滚轮、模板
