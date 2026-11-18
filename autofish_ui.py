@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import app_paths
+import autofish_ownership as own
 import autofish_hotkeys as hotkeys
 from autofish_ipc import RuntimeClient
 
@@ -96,6 +97,7 @@ RectTuple = Tuple[int, int, int, int]
 
 _FIELD_ROWS = (
     ("焦点", ("focus_text",), None),
+    ("控制权", ("ownership_text",), None),
     ("模式", ("mode",), None),
     ("原因", ("reason",), None),
     ("状态/鱼 elapsed", ("state_elapsed", "fish_elapsed"), " / "),
@@ -685,6 +687,7 @@ class ViewModel:
     reason: str
     foreground: Optional[bool]
     focus_text: str
+    ownership_text: str
     fight_mode_raw: str
     state_elapsed: str
     cur: str
@@ -776,6 +779,11 @@ def build_view(
         reason=reason,
         foreground=foreground_value,
         focus_text=focus_text(foreground_value, fight_mode=fight_mode_value, reason=reason_value, state=state_raw),
+        ownership_text=own.ownership_text(own.ownership_state(
+            foreground_value,
+            returning=(_optional_bool(snap.get("recovery_pending")) or _optional_bool(stat.get("recovery_pending")) or False),
+            stopped=stopped,
+        )),
         fight_mode_raw=_upper_text(fight_mode_value),
         state_elapsed=_elapsed_text(
             _first(snap, "state_elapsed", "state_elapsed_s", "state_time", "elapsed")
@@ -1578,6 +1586,11 @@ class AutoFishPanel:
         self.tk = tk
         self.root = root
         self.demo = bool(demo)
+        self._notice_since: Optional[float] = None
+        self._notice_state: bool = False
+        self._notice_nonmodal = bool(os.environ.get("RF4_OWNERSHIP_NOTICE_NONMODAL"))
+        self._notice_beep = not bool(os.environ.get("RF4_OWNERSHIP_NOTICE_MUTE"))
+        self._clock = time.time
         self._client = None
         if not self.demo:
             self._client = client or RuntimeClient(endpoint_path, timeout=0.9)
@@ -1914,6 +1927,21 @@ class AutoFishPanel:
         states = button_states(view)
         self._refresh_buttons(states)
         self._update_recovery_bar(view)
+        self._update_ownership_notice(view)
+
+    def _update_ownership_notice(self, view: ViewModel) -> None:
+        """控制权 工具→用户 边沿弹告知；离线/停止/demo 不弹。"""
+        owner = getattr(view, "ownership_text", "")
+        is_user = owner == own.ownership_text(own.USER)
+        prev = getattr(self, "_prev_ownership", None)
+        self._prev_ownership = owner
+        if not view.connected or view.stopped or self.demo:
+            if not is_user:
+                self._dismiss_ownership_notice()
+            return
+        if is_user and prev == own.ownership_text(own.TOOL) and not self._notice_state:
+            self._show_ownership_notice(self._clock())
+
     def _update_recovery_bar(self, view: ViewModel) -> None:
         """失焦→聚焦 且处于搏鱼阶段时显示一次确认条，不自动恢复动作。"""
         frame = getattr(self, "_recover_frame", None)
@@ -1951,6 +1979,128 @@ class AutoFishPanel:
         """放弃本条用 stop_after_fish，不立刻强停，避免断线丢鱼。"""
         self._hide_recovery_bar()
         self._send_command("stop_after_fish")
+
+    # 控制权交接告知：默认标准 message box（模态、不可忽略、夺焦点直到确认）。
+    # 后台 bot 是独立进程，对话框暂停面板轮询不影响它。
+    # 见 CONTROL-OWNERSHIP-PLAN.md §4（2026-11-18 二次修正）。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _notice_message(since: Optional[float], now: float) -> str:
+        """对话框正文：大字诉求 + 绝对时刻 + 人类可读时长 + 后续说明。"""
+        clock = time.strftime("%H:%M:%S", time.localtime(since or now))
+        duration = own.human_duration(now - since) if since is not None else "—"
+        return (
+            "工具已停止输入，控制权交还给你。\n\n"
+            "停止于 %s  ·  已停止 %s\n\n"
+            "点「确定」关闭本提示。后台钓鱼进程未受影响；\n"
+            "回到游戏后如需继续，请点面板的「回到游戏」或「开始/恢复」。"
+        ) % (clock, duration)
+
+    def _show_ownership_notice(self, since: Optional[float]) -> None:
+        """显示告知。默认 message box（模态不可忽略）；可切非模态置顶窗。"""
+        now = self._clock()
+        self._notice_since = since if since is not None else now
+        self._notice_state = True
+        try:
+            message = self._notice_message(self._notice_since, now)
+        except Exception:
+            message = "工具已停止输入，控制权交还给你。"
+
+        if self._notice_beep and not self.demo:
+            try:
+                import winsound  # noqa: PLC0415 - Windows only
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+
+        if self._notice_nonmodal:
+            self._show_ownership_notice_nonmodal(message)
+            return
+
+        # 标准 message box：showwarning 是模态的，夺焦点直到用户点确定，
+        # 这正符合「不可忽略」。用 after 延迟，避免在 _apply_view 内重入；
+        # 返回后复位状态，保证下一次交接边沿还能再弹。
+        try:
+            messagebox = self.tk.messagebox
+
+            def _show_then_reset() -> None:
+                try:
+                    messagebox.showwarning(title="控制权已交还给你", message=message)
+                finally:
+                    self._dismiss_ownership_notice()
+
+            self.root.after(0, _show_then_reset)
+        except Exception:
+            self._dismiss_ownership_notice()
+
+    def _build_ownership_notice(self) -> None:
+        """非模态模式的置顶提示窗（默认不走这里）。"""
+        tk = self.tk
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        win.configure(bg="#b71c1c")
+        self._notice_win = win
+        frame = tk.Frame(win, bg="#b71c1c", padx=18, pady=14)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, text="工具已停止输入 · 控制权交还给你",
+                 font=("Microsoft YaHei UI", 15, "bold"),
+                 fg="#ffffff", bg="#b71c1c").pack(anchor="w")
+        self._notice_body = tk.Label(
+            frame, text="", font=("Microsoft YaHei UI", 12),
+            fg="#fff3e0", bg="#b71c1c", justify="left")
+        self._notice_body.pack(anchor="w", pady=(8, 0))
+        tk.Button(frame, text="我知道了",
+                  command=self._dismiss_ownership_notice,
+                  font=("Microsoft YaHei UI", 11, "bold"),
+                  bg="#ffffff", fg="#b71c1c", relief="groove", bd=1,
+                  padx=12, pady=3, highlightthickness=0).pack(anchor="e", pady=(10, 0))
+
+    def _show_ownership_notice_nonmodal(self, message: str) -> None:
+        win = getattr(self, "_notice_win", None)
+        if win is None:
+            return
+        try:
+            w, h = 460, 170
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2),
+                                          max(0, int(sh * 0.06))))
+            body = getattr(self, "_notice_body", None)
+            if body is not None:
+                body.configure(text=message)
+            win.deiconify()
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        self._refresh_ownership_notice()
+
+    def _refresh_ownership_notice(self) -> None:
+        """仅非模态窗需要滚动刷新时长；message box 是静态文本。"""
+        if not self._notice_state or not self._notice_nonmodal:
+            return
+        body = getattr(self, "_notice_body", None)
+        if body is not None:
+            body.configure(text=self._notice_message(
+                self._notice_since, self._clock()))
+        try:
+            self.root.after(1000, self._refresh_ownership_notice)
+        except Exception:
+            pass
+
+    def _dismiss_ownership_notice(self) -> None:
+        if self._notice_nonmodal:
+            win = getattr(self, "_notice_win", None)
+            if win is not None:
+                try:
+                    win.withdraw()
+                except Exception:
+                    pass
+        self._notice_state = False
+        self._notice_since = None
 
     def _refresh_buttons(self, states: Optional[ButtonStates] = None) -> None:
         """Apply the same button gate to clicks and hotkeys."""
