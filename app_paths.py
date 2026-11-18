@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "RF4AutoFish"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 
 def is_frozen() -> bool:
