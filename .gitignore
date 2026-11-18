@@ -32,6 +32,10 @@ autofish.process.json
 autofish.endpoint.json.*.tmp
 autofish.process.json.*.tmp
 
+# 会话时限 / 收尾运行数据（测试与实机运行时在仓根生成的临时文件）
+session.json
+winddown_request.json
+
 # OCR 模型（PP-OCRv6 small det/rec + v4 备份，约 45MB 二进制）不入库：
 # 运行时从本地 models/ocr 加载，离线可用、不下载；部署时自行放入该目录。
 /models/ocr/*.onnx
