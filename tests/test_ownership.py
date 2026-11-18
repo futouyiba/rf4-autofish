@@ -156,6 +156,65 @@ class NoticeMessageTests(unittest.TestCase):
         panel._update_ownership_notice(view)
         self.assertFalse(panel.root.after.called)
 
+    def test_alternating_handoffs_pop_each_time(self) -> None:
+        """多次 TOOL→USER 交接每次都弹；复位失败会导致第二次不弹。"""
+        from unittest import mock
+        import autofish_ui
+
+        panel = object.__new__(autofish_ui.AutoFishPanel)
+        panel._notice_nonmodal = False
+        panel._notice_beep = False
+        panel.demo = False
+        panel._clock = lambda: 1000.0
+        panel._notice_state = False
+        panel._notice_since = None
+        panel._prev_ownership = own.ownership_text(own.TOOL)
+        fake_mb = mock.Mock()
+        panel.tk = mock.Mock(messagebox=fake_mb)
+        panel.root = mock.Mock()
+
+        tool = mock.Mock(connected=True, stopped=False)
+        tool.ownership_text = own.ownership_text(own.TOOL)
+        user = mock.Mock(connected=True, stopped=False)
+        user.ownership_text = own.ownership_text(own.USER)
+
+        for _ in range(3):
+            panel._update_ownership_notice(user)   # TOOL -> USER
+            cb = panel.root.after.call_args[0][1]
+            cb()                                    # 弹窗 -> 关闭复位
+            panel._update_ownership_notice(tool)   # USER -> TOOL
+
+        self.assertEqual(fake_mb.showwarning.call_count, 3)
+
+    def test_user_stays_user_does_not_repopup(self) -> None:
+        """持续 USER 不重复弹，避免骚扰。"""
+        from unittest import mock
+        import autofish_ui
+
+        panel = object.__new__(autofish_ui.AutoFishPanel)
+        panel._notice_nonmodal = False
+        panel._notice_beep = False
+        panel.demo = False
+        panel._clock = lambda: 1000.0
+        panel._notice_state = False
+        panel._notice_since = None
+        panel._prev_ownership = own.ownership_text(own.TOOL)
+        fake_mb = mock.Mock()
+        panel.tk = mock.Mock(messagebox=fake_mb)
+        panel.root = mock.Mock()
+        user = mock.Mock(connected=True, stopped=False)
+        user.ownership_text = own.ownership_text(own.USER)
+
+        panel._update_ownership_notice(user)
+        cb = panel.root.after.call_args[0][1]
+        cb()
+        # 后续多帧仍是 USER，不应再登记
+        panel.root.after.reset_mock()
+        for _ in range(5):
+            panel._update_ownership_notice(user)
+        self.assertFalse(panel.root.after.called)
+        self.assertEqual(fake_mb.showwarning.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
