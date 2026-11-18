@@ -95,6 +95,7 @@ MISSING = "—"
 RectTuple = Tuple[int, int, int, int]
 
 _FIELD_ROWS = (
+    ("焦点", ("focus_text",), None),
     ("模式", ("mode",), None),
     ("原因", ("reason",), None),
     ("状态/鱼 elapsed", ("state_elapsed", "fish_elapsed"), " / "),
@@ -574,6 +575,76 @@ def is_confirm_ready_state(state: Any) -> bool:
     return _upper_text(state) in CONFIRM_READY_STATES
 
 
+# 前台丢失 UX（分层规划第一层）：只做可解释展示，不改变任何按钮门或动作。
+_FIGHT_PHASES = frozenset({"FIGHT", "LAND", "NET"})
+
+
+def focus_text(
+    foreground: Any,
+    fight_mode: Any = None,
+    reason: Any = None,
+    state: Any = None,
+) -> str:
+    """面向用户的前台状态说明；不编造未知值，也不触发任何动作。
+
+    * 搏鱼类阶段失焦时提示"回来需确认"——鱼可能已脱钩，不能假装可无缝续；
+    * 非搏鱼阶段失焦只说明键鼠已停，避免用户以为程序坏了；
+    * ``foreground`` 未知时明说未知，不猜。
+    """
+    fg = _optional_bool(foreground)
+    if fg is True:
+        return "游戏在前台"
+    phase = _upper_text(fight_mode) or _upper_text(state)
+    in_fight = phase in _FIGHT_PHASES or any(
+        phase.startswith(p + "_") for p in _FIGHT_PHASES
+    )
+    if fg is False:
+        return "已暂停·搏鱼中（回来需确认）" if in_fight else "已暂停·失焦（键鼠已停）"
+    return "焦点未知"
+
+
+def needs_recovery_confirm(fight_mode: Any, state: Any = None) -> bool:
+    """搏鱼/临岸/抄网/结算阶段失焦回来必须人工确认，不能自动续。
+
+    与 focus_text 的搏鱼判定同一套阶段；单独成函数便于 UI 和测试共用，
+    且保证"自动恢复"永远不会落到这些高风险阶段。
+    """
+    phase = _upper_text(fight_mode) or _upper_text(state)
+    if not phase:
+        return False
+    return phase in _FIGHT_PHASES or any(
+        phase.startswith(p + "_") for p in _FIGHT_PHASES
+    )
+
+
+def mode_allows_confirm(mode: Any) -> bool:
+    """AUTO may confirm; OBSERVE/MANUAL/BLOCKED must never enable the button.
+
+    A missing mode is tolerated so snapshots from older runtimes keep working;
+    it is never treated as a substitute for the state check.
+    """
+    value = _upper_text(mode)
+    if not value:
+        return True
+    return value in CONFIRM_MODES
+
+
+def net_pending(snapshot: Any) -> Optional[bool]:
+    """Return the explicit NET-confirmation pending flag, if present."""
+    if not isinstance(snapshot, Mapping):
+        return None
+    value = _first(
+        snapshot,
+        "net_pending",
+        "net_pending_confirmation",
+        "pending_net",
+        "awaiting_net_confirmation",
+        "net.pending",
+        "net.confirm_pending",
+    )
+    return _optional_bool(value)
+
+
 def mode_allows_confirm(mode: Any) -> bool:
     """AUTO may confirm; OBSERVE/MANUAL/BLOCKED must never enable the button.
 
@@ -613,6 +684,8 @@ class ViewModel:
     mode_raw: str
     reason: str
     foreground: Optional[bool]
+    focus_text: str
+    fight_mode_raw: str
     state_elapsed: str
     cur: str
     confidence: str
@@ -688,6 +761,10 @@ def build_view(
     message = stat.get("message")
     message_text = "" if message is None else str(message).strip()
 
+    foreground_value = _optional_bool(_first(snap, "foreground", "foreground.active", "is_foreground"))
+    fight_mode_value = _first(snap, "fight_mode", "fight.state", "fight_state")
+    reason_value = _first(snap, "state.reason", "reason", "state_reason", "last_reason")
+
     return ViewModel(
         connected=bool(connected),
         stopped=stopped,
@@ -697,9 +774,9 @@ def build_view(
         mode=mode_text,
         mode_raw=mode_raw,
         reason=reason,
-        foreground=_optional_bool(
-            _first(snap, "foreground", "foreground.active", "is_foreground")
-        ),
+        foreground=foreground_value,
+        focus_text=focus_text(foreground_value, fight_mode=fight_mode_value, reason=reason_value, state=state_raw),
+        fight_mode_raw=_upper_text(fight_mode_value),
         state_elapsed=_elapsed_text(
             _first(snap, "state_elapsed", "state_elapsed_s", "state_time", "elapsed")
         ),
@@ -836,12 +913,24 @@ def can_start_background() -> bool:
     return True
 
 
+def can_refocus(connected: bool, stopped: bool, foreground: Any) -> bool:
+    """「回到游戏」只在后台在线、未停止、且当前确实失焦时可用。
+
+    前台已经正常时不需要它；后台离线时发命令没有意义（refocus 由后台执行）。
+    """
+    if not bool(connected) or bool(stopped):
+        return False
+    return _optional_bool(foreground) is False
+    return True
+
+
 def can_emergency_stop() -> bool:
     return True
 
 
 @dataclass(frozen=True)
 class ButtonStates:
+    refocus: bool
     start_background: bool
     resume: bool
     observe: bool
@@ -871,6 +960,7 @@ def button_states(
     stopped = view.stopped
     return ButtonStates(
         start_background=can_start_background(),
+        refocus=can_refocus(connected, stopped, view.foreground),
         resume=can_resume(stopped, connected),
         observe=can_observe(stopped, connected),
         stop=can_stop(stopped, connected),
@@ -1650,6 +1740,7 @@ class AutoFishPanel:
 
         specs = (
             ("start_background", "启动后台·离线", self._start_background),
+            ("refocus", "回到游戏", lambda: self._send_command("refocus")),
             ("resume", "开始/恢复", lambda: self._send_command("resume")),
             ("observe", "仅观察", lambda: self._send_command("observe")),
             ("stop", "立即停止", lambda: self._send_command("stop")),
@@ -1822,6 +1913,44 @@ class AutoFishPanel:
 
         states = button_states(view)
         self._refresh_buttons(states)
+        self._update_recovery_bar(view)
+    def _update_recovery_bar(self, view: ViewModel) -> None:
+        """失焦→聚焦 且处于搏鱼阶段时显示一次确认条，不自动恢复动作。"""
+        frame = getattr(self, "_recover_frame", None)
+        if frame is None:
+            return
+        fg = view.foreground
+        prev = self._last_foreground
+        self._last_foreground = fg
+        show = (
+            prev is False
+            and fg is True
+            and needs_recovery_confirm(getattr(view, "fight_mode_raw", None), view.state_raw)
+            and not self.demo
+        )
+        if show and not self._recover_visible:
+            self._recover_var.set("游戏已回到前台。搏鱼/收网可能已变化，请确认本条怎么处理。")
+            frame.pack(fill="x", before=getattr(self, "_nav_anchor", None))
+            self._recover_visible = True
+        elif not show and self._recover_visible:
+            frame.pack_forget()
+            self._recover_visible = False
+
+    def _hide_recovery_bar(self) -> None:
+        frame = getattr(self, "_recover_frame", None)
+        if frame is not None and self._recover_visible:
+            frame.pack_forget()
+            self._recover_visible = False
+
+    def _on_recover_continue(self) -> None:
+        """用户确认继续本条：走 resume 的既有前台门，不直接动作。"""
+        self._hide_recovery_bar()
+        self._send_command("resume")
+
+    def _on_recover_abandon(self) -> None:
+        """放弃本条用 stop_after_fish，不立刻强停，避免断线丢鱼。"""
+        self._hide_recovery_bar()
+        self._send_command("stop_after_fish")
 
     def _refresh_buttons(self, states: Optional[ButtonStates] = None) -> None:
         """Apply the same button gate to clicks and hotkeys."""
@@ -2065,6 +2194,8 @@ class AutoFishPanel:
                 self._set_ack("热键 F6：bot_ctl 不支持 start（未启动）")
                 return
             self._start_background()
+        if name == "refocus":
+            self._dispatch_hotkey("refocus")
         elif name == "resume":
             self._begin_resume_release_wait()
         elif name == "stop":

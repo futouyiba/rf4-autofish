@@ -40,6 +40,7 @@ COMMANDS = frozenset(
         "observe",
         "confirm_ready",
         "confirm_net_retracted",
+        "refocus",
     }
 )
 _ACK_STATUSES = frozenset({"accepted", "executed", "rejected"})

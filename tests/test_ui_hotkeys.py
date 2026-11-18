@@ -190,10 +190,10 @@ def wait_for(output, kind: str, timeout: float = 2.0):
 class DefinitionTests(unittest.TestCase):
     def test_all_keys_use_ctrl_alt_shift_and_norepeat(self) -> None:
         names = [binding.name for binding in hk.HOTKEY_BINDINGS]
-        self.assertEqual(names, ["start_background", "resume", "observe", "stop_after_fish", "stop"])
+        self.assertEqual(names, ["refocus", "start_background", "resume", "observe", "stop_after_fish", "stop"])
         self.assertEqual(
             [binding.key for binding in hk.HOTKEY_BINDINGS],
-            ["F6", "F7", "F8", "F9", "F10"],
+            ["F5", "F6", "F7", "F8", "F9", "F10"],
         )
         for binding in hk.HOTKEY_BINDINGS:
             with self.subTest(binding=binding.name):
@@ -297,7 +297,7 @@ class ListenerTests(unittest.TestCase):
         self.assertEqual(api.order[0], "peek")
         self.assertTrue(all(item[0] == "register" for item in api.order[1:]))
         self.assertTrue(report["enabled"])
-        self.assertEqual(len(report["items"]), 5)
+        self.assertEqual(len(report["items"]), len(hk.HOTKEY_BINDINGS))
         listener.stop()
         self.assertFalse(listener.is_alive())
 
@@ -343,7 +343,7 @@ class ListenerTests(unittest.TestCase):
         self.assertFalse(listener.is_alive())
         self.assertEqual(
             sorted(item for item, _tid in api.unregister_calls),
-            [0xA700, 0xA701, 0xA703, 0xA704],
+            [0xA700, 0xA701, 0xA703, 0xA704, 0xA705],
         )
         for _item, thread_id in api.unregister_calls:
             self.assertEqual(thread_id, listener.ident)
@@ -651,7 +651,7 @@ class PanelHotkeyStatusTests(unittest.TestCase):
         self.assertEqual(harness.panel._hotkey_lifecycle, listener.lifecycle)
         report = wait_for(harness.panel._output, "hotkeys")
         self.assertTrue(report["enabled"])
-        self.assertEqual(len(fake_api.register_calls), 5)
+        self.assertEqual(len(fake_api.register_calls), len(hk.HOTKEY_BINDINGS))
 
 
 if __name__ == "__main__":

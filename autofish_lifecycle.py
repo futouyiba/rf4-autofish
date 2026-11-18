@@ -307,6 +307,7 @@ class RuntimeCallbacks:
     # 协议侧“线还在水里” （0e07 在流）。用于 OBSERVE 弹回 PROBING 后恢复：
     # 线已经在水里就不该重抛，直接回 WAIT_BITE 等口。
     protocol_line_in_water: Optional[Callable[[], Optional[bool]]] = None
+    refocus_game: Optional[Callable[[], bool]] = None
     log: Optional[Callable[[str], Any]] = None
     clock: Callable[[], float] = time.monotonic
 
@@ -330,6 +331,7 @@ class RuntimeCallbacks:
             "relogin",
             "protocol_fight",
             "protocol_line_in_water",
+            "refocus_game",
             "log",
         ):
             value = getattr(self, name)
@@ -754,6 +756,20 @@ class LifecycleCoordinator:
 
         if self._state is AutoFishState.STOPPED:
             return self._ack(cid, "rejected", "session stopped")
+
+        if name == "refocus":
+            if self._foreground_fresh(now):
+                return self._ack(cid, "executed", "already foreground")
+            fn = self._cb.refocus_game
+            if fn is None:
+                return self._ack(cid, "rejected", "refocus unavailable")
+            try:
+                requested = bool(fn())
+            except Exception as exc:
+                return self._ack(cid, "rejected", "refocus_error:%s" % type(exc).__name__)
+            if requested:
+                return self._ack(cid, "accepted", "refocus requested")
+            return self._ack(cid, "rejected", "refocus throttled")
 
         if name == "resume":
             if self._control.stopped:

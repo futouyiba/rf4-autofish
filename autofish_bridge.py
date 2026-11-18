@@ -2167,6 +2167,7 @@ class Bridge:
             relogin=self.relogin,
             protocol_fight=self.protocol_fight,
             protocol_line_in_water=self.protocol_line_in_water,
+            refocus_game=lambda: self.ensure_foreground(self._action_control()),
             log=self._emit,
             clock=self._clock,
         )

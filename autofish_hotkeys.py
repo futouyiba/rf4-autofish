@@ -45,6 +45,7 @@ ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12
+VK_F5 = 0x74
 VK_F6 = 0x75
 VK_F7 = 0x76
 VK_F8 = 0x77
@@ -68,6 +69,7 @@ class HotkeyBinding:
 
 
 HOTKEY_BINDINGS: Tuple[HotkeyBinding, ...] = (
+    HotkeyBinding("refocus", "F5", "Ctrl+Alt+Shift+F5", 0xA705, VK_F5),
     # 启动后台放在最前：面板独占 F6，组合键不会影响游戏里的单独 F6(抬竿)。
     HotkeyBinding(
         "start_background", "F6", "Ctrl+Alt+Shift+F6", 0xA700, VK_F6
