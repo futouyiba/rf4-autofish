@@ -1666,10 +1666,23 @@ FISH_ICON_CENTER = (549, 1024)   # 图标中心
 FISH_ICON_HALF = (20, 16)        # 裁剪半径：x,y
 FISH_ICON_RING = (9, 14)         # 测量"外环"的半径区间
 FISH_ICON_WHITE_MIN = 60         # 外环白色像素阈值（有=110+，无=0~22）
+# 夜间/雾天 HUD 会被整体压暗：2026-11-18 夜间实测该 ROI 峰值亮度只有 178，
+# 写死的 v>=238 恒为 0 → 咬钩漏判 20 秒、超时收线变成摇两下轮。
+FISH_ICON_DARK_MIN_V = 150       # 暗场景：环上 95 分位低于此值视为"没有图标"
+FISH_ICON_DARK_FLOOR = 140       # 暗场景判据的绝对亮度下限
+FISH_ICON_DARK_GAP = 18          # 暗场景：环像素需比 95 分位低这么少才算"亮环"
 
 
 def fish_icon_present() -> bool:
-    """底部圆形鱼图标是否出现 = 是否有鱼咬钩。"""
+    """底部圆形鱼图标是否出现 = 是否有鱼咬钩。
+
+    双层判据：
+    1) 亮场景（白天）：环上 v>=238 且 s<=28 的白像素 >= 60，与旧行为完全一致；
+    2) 暗场景（夜间/雾）：HUD 整体压暗，绝对值判据失效。改用 ROI 自身动态范围——
+       环上亮度接近本 ROI 的 95 分位即视为亮环（图标是深色背景上的一圈灰白）。
+    没有图标时 ROI 是一片暗背景，95 分位低于 FISH_ICON_DARK_MIN_V，直接 False，
+    所以不会因"太暗"而误报。
+    """
     import cv2
 
     cx, cy = FISH_ICON_CENTER
@@ -1682,8 +1695,20 @@ def fish_icon_present() -> bool:
     yy, xx = np.mgrid[0:hh * 2, 0:hw * 2]
     rr = np.sqrt((yy - hh) ** 2 + (xx - hw) ** 2)
     ring = (rr >= FISH_ICON_RING[0]) & (rr <= FISH_ICON_RING[1])
+
     white = (v >= 238) & (s <= 28)
-    return int(white[ring].sum()) >= FISH_ICON_WHITE_MIN
+    if int(white[ring].sum()) >= FISH_ICON_WHITE_MIN:
+        return True
+
+    vals = v[ring]
+    if vals.size == 0:
+        return False
+    hi = int(np.percentile(vals, 95))
+    if hi < FISH_ICON_DARK_MIN_V:
+        return False
+    thr = max(FISH_ICON_DARK_FLOOR, hi - FISH_ICON_DARK_GAP)
+    low_sat = (v >= thr) & (s <= 80)
+    return int(low_sat[ring].sum()) >= FISH_ICON_WHITE_MIN
 
 
 def is_fish_hooked_by_bar() -> bool:
