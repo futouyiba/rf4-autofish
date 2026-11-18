@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Mapping, Optional
 
 from autofish_control import ControlSession
@@ -42,11 +43,15 @@ class AutoFishRuntime:
         initial_auto: bool = False,
         server: Any = None,
         epoch: Optional[str] = None,
+        session_timer: Any = None,
     ) -> None:
         if not isinstance(callbacks, RuntimeCallbacks):
             raise TypeError("AutoFishRuntime requires RuntimeCallbacks")
         self._control = control if control is not None else ControlSession()
         self._config = config or LifecycleConfig()
+        # 会话时限计时器（可选）：由宿主注入，None 时本功能完全不启用。
+        self._session_timer = session_timer
+        self._winddown_pending = False
         self._coordinator = LifecycleCoordinator(
             callbacks,
             self._control,
@@ -96,9 +101,61 @@ class AutoFishRuntime:
             except Exception:  # noqa: BLE001 - IPC 故障不能改变钓鱼安全边界
                 commands = None
         snapshot = self._coordinator.step(commands)
+        self._tick_session(snapshot)
         self._flush_acks()
         self._publish(snapshot)
         return snapshot
+
+    def _tick_session(self, snapshot: dict[str, Any]) -> None:
+        """会话时限：AUTO 运行时累计，否则暂停；到期发一次 stop_after_fish。
+
+        只在注入了 session_timer 时生效；所有判断不碰 lifecycle 状态机。
+        """
+        timer = self._session_timer
+        if timer is None:
+            return
+        now = float(self._clock())
+        auto = bool(getattr(self._coordinator, "auto_requested", False))
+        state = getattr(self._coordinator.state, "name", self._coordinator.state)
+        active = auto and str(state).upper() not in {"STOPPED", "STOPPING", "FAULT"}
+        if active:
+            timer.resume(now)
+        else:
+            timer.pause(now)
+        expired = timer.expired(now)
+        if expired and not self._winddown_pending:
+            # 到时只锁存"钓完最后一条"，绝不强停丢鱼。
+            self._control.request_stop_after_fish()
+            self._winddown_pending = True
+            self._write_winddown_request()
+        snapshot["session_status"] = {
+            "limit_seconds": timer.limit,
+            "elapsed_seconds": round(timer.elapsed_seconds(now), 1),
+            "remaining_seconds": round(timer.remaining(now), 1),
+            "state": timer.state,
+            "expired": expired,
+            "winddown_pending": self._winddown_pending,
+        }
+
+    def _write_winddown_request(self) -> None:
+        """到时限时写触发文件，供面板在 bot 退出后拉起收尾（不依赖 IPC）。"""
+        try:
+            import json  # noqa: PLC0415
+            import os  # noqa: PLC0415
+            import app_paths  # noqa: PLC0415
+            p = app_paths.data_path("winddown_request.json")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"requested_wall": time.strftime("%H:%M:%S"),
+                           "reason": "session_limit"}, f, ensure_ascii=False)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
+    @property
+    def _clock(self):
+        return getattr(self._coordinator, "_clock", time.time)
 
     # ------------------------------------------------------------------
     # 主循环
@@ -133,6 +190,8 @@ class AutoFishRuntime:
         finally:
             self.shutdown()
             self._latest = self._coordinator.snapshot()
+            # 最终快照也带上会话状态，面板才能在 bot 退出后看到收尾标志。
+            self._tick_session(self._latest)
             self._publish(self._latest)
             self._running = False
         return self._latest

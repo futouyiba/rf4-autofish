@@ -2341,6 +2341,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         server = RuntimeServer(control, endpoint)
         server.start()
+        # 会话时限：读 session.json，注入计时器（默认 8h，可在面板改）。
+        try:
+            import autofish_session_store as ss  # noqa: PLC0415
+            session_timer, session_note = ss.load_session()
+            if session_note:
+                print("[session] %s" % session_note, flush=True)
+        except Exception:
+            session_timer, ss = None, None
         runtime = AutoFishRuntime(
             bridge.callbacks(),
             control=control,
@@ -2348,6 +2356,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             config=LifecycleConfig(fight=fight_config),
             initial_auto=False,   # 生产必须由 UI 显式 resume/confirm_ready
             server=server,
+            session_timer=session_timer,
         )
         # ---- 协议半途接手：抓包器活着时按其状态快照选起点状态 ----
         # 顺序：runtime 起来后、主循环开跑前，一次性应用。抓包器没跑/
@@ -2385,6 +2394,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
         runtime.run()
+        # 退出时保存会话计时状态（暂停态 + 累计时长）。
+        if ss is not None and session_timer is not None:
+            try:
+                session_timer.pause(time.time())
+                ss.save_session(session_timer)
+            except Exception:
+                pass
     except KeyboardInterrupt:
         try:
             if bridge is not None:

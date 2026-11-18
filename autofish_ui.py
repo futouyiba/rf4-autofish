@@ -20,6 +20,7 @@ child process.  Tk is imported lazily inside :func:`main` / the panel class.
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import os
 import queue
@@ -33,6 +34,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import app_paths
 import autofish_ownership as own
+from autofish_winddown_client import WinddownClient
+import autofish_session_timer as session_timer
 import autofish_hotkeys as hotkeys
 from autofish_ipc import RuntimeClient
 
@@ -101,6 +104,7 @@ _FIELD_ROWS = (
     ("模式", ("mode",), None),
     ("原因", ("reason",), None),
     ("状态/鱼 elapsed", ("state_elapsed", "fish_elapsed"), " / "),
+    ("会话剩余", ("session_limit_text",), None),
     ("cur / 可信度", ("cur", "confidence"), "  ·  "),
     ("bar / tier", ("bar", "tier"), " / "),
     ("ring", ("ring",), None),
@@ -450,6 +454,24 @@ def _elapsed_text(value: Any) -> str:
     return "%.1fs" % number
 
 
+def _session_limit_text(value: Any) -> str:
+    """会话时限状态行：剩余时长 + 是否到时。未知不编造。"""
+    if not isinstance(value, Mapping):
+        return MISSING
+    remaining = _first(value, "remaining_seconds")
+    state = str(_first(value, "state") or "").strip()
+    expired = _optional_bool(value.get("expired"))
+    if expired is True or state == session_timer.EXPIRED:
+        return "已到时（收尾中）" if _optional_bool(
+            value.get("winddown_pending")) else "已到时"
+    if remaining is None:
+        return MISSING
+    number = _number(remaining)
+    if number is None:
+        return MISSING
+    return session_timer.remaining_text(number)
+
+
 def _heartbeat_text(value: Any) -> str:
     if value is None:
         return MISSING
@@ -688,6 +710,7 @@ class ViewModel:
     foreground: Optional[bool]
     focus_text: str
     ownership_text: str
+    session_limit_text: str
     fight_mode_raw: str
     state_elapsed: str
     cur: str
@@ -784,6 +807,9 @@ def build_view(
             returning=(_optional_bool(snap.get("recovery_pending")) or _optional_bool(stat.get("recovery_pending")) or False),
             stopped=stopped,
         )),
+        session_limit_text=_session_limit_text(
+            snap.get("session_status") or snap.get("session_limit")
+        ),
         fight_mode_raw=_upper_text(fight_mode_value),
         state_elapsed=_elapsed_text(
             _first(snap, "state_elapsed", "state_elapsed_s", "state_time", "elapsed")
@@ -1590,6 +1616,7 @@ class AutoFishPanel:
         self._notice_state: bool = False
         self._notice_nonmodal = bool(os.environ.get("RF4_OWNERSHIP_NOTICE_NONMODAL"))
         self._notice_beep = not bool(os.environ.get("RF4_OWNERSHIP_NOTICE_MUTE"))
+        self._winddown = self._build_winddown_client()
         self._clock = time.time
         self._client = None
         if not self.demo:
@@ -1625,6 +1652,7 @@ class AutoFishPanel:
         self._apply_own_window_style()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_output)
+        self.root.after(1500, self._poll_winddown)
         self.root.after(250, self._layout_tick)
         self.root.after(800, self._sniff_probe)
         self._apply_follow()
@@ -2101,6 +2129,84 @@ class AutoFishPanel:
                     pass
         self._notice_state = False
         self._notice_since = None
+
+    # 会话到时限的自动收尾（触发文件由 bot 写；面板拉起独立执行器 + 弹结果）
+    # ------------------------------------------------------------------
+    def _build_winddown_client(self) -> WinddownClient:
+        def data_path(name: str) -> Path:
+            try:
+                return app_paths.data_path(name)
+            except Exception:
+                return Path(__file__).resolve().parent / "data" / name
+
+        def read(path: Path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else None
+            except (OSError, ValueError):
+                return None
+
+        def remove(path: Path) -> None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+        return WinddownClient(
+            spawn=self._spawn_winddown, read=read, remove=remove,
+            request_path=data_path("winddown_request.json"),
+            result_path=data_path("winddown_result.json"),
+        )
+
+    def _spawn_winddown(self) -> bool:
+        """拉起独立收尾进程（不阻塞 Tk；bot 已停才会被调用）。"""
+        if self.demo:
+            return False
+        script = Path(__file__).resolve().parent / "autofish_winddown_runner.py"
+        try:
+            subprocess.Popen(
+                [sys.executable, "-u", str(script)],
+                cwd=str(Path(__file__).resolve().parent),
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
+                               | subprocess.CREATE_BREAKAWAY_FROM_JOB),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.nav_var.set("走位：时限到，正在收尾（去鱼市→卖鱼→小退）")
+            return True
+        except Exception as exc:
+            self.nav_var.set("走位：收尾启动失败 %s" % type(exc).__name__)
+            return False
+
+    def _poll_winddown(self) -> None:
+        try:
+            result = self._winddown.poll()
+        except Exception:
+            result = None
+        if result is not None:
+            self._show_winddown_result(result)
+        try:
+            self.root.after(1000, self._poll_winddown)
+        except Exception:
+            pass
+
+    def _show_winddown_result(self, result: dict) -> None:
+        """收尾完成/失败弹标准 message box（含每步结果与时间）。"""
+        try:
+            message = self._winddown.summary_text(result)
+        except Exception:
+            message = "时限收尾已结束，请查看 data/winddown_result.json。"
+        if self._notice_beep and not self.demo:
+            try:
+                import winsound  # noqa: PLC0415
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+        try:
+            self.tk.messagebox.showwarning(title="本次钓鱼已到时限", message=message)
+        except Exception:
+            pass
+        self.nav_var.set("走位：时限收尾已结束")
 
     def _refresh_buttons(self, states: Optional[ButtonStates] = None) -> None:
         """Apply the same button gate to clicks and hotkeys."""

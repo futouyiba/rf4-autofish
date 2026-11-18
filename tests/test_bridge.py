@@ -345,7 +345,8 @@ class FakeRuntime:
     last = None
 
     def __init__(
-        self, callbacks, control=None, *, config=None, initial_auto=False, server=None
+        self, callbacks, control=None, *, config=None, initial_auto=False,
+        server=None, session_timer=None
     ):
         self.callbacks = callbacks
         self.control = control

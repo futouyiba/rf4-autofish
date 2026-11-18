@@ -306,3 +306,48 @@ def _read(io: Any, default: str) -> Tuple[str, float, float]:
         return screen_kind(io.capture())
     except Exception:  # noqa: BLE001
         return default, 0.0, 0.0
+
+
+def logout(io: Any, control: Any = None, cfg: Optional[ReloginConfig] = None,
+           log: Optional[Callable[[str], None]] = None,
+           *, sleep: Optional[Callable[[float], None]] = None,
+           now: Optional[Callable[[], float]] = None) -> dict:
+    """小退并停在登录界面（收工下线，不点「登录」）。
+
+    复用本模块已有的 Esc→退出→是→等登录界面流程，但不执行"点登录回世界"。
+    任何一步失败抛 ReloginError。调用方必须已松开所有按键。
+    """
+    cfg = cfg or ReloginConfig()
+    emit = log or _noop
+    clock = _Clock(sleep, now)
+    started = clock.now()
+    deadline_total = started + cfg.total_timeout
+    size = _client_size(io)
+
+    def _budget(step: float) -> float:
+        return min(clock.now() + step, deadline_total)
+
+    emit("小退: 开始（窗口 %dx%d，停在登录界面）" % size)
+    for attempt in range(cfg.exit_retries + 1):
+        _checkpoint(control)
+        io.key("esc")
+        clock.sleep(cfg.esc_settle)
+        kind, mean, _b = _read(io, KIND_ERROR)
+        emit("小退: 菜单 %s mean=%.1f" % (kind, mean))
+        _click(io, cfg, cfg.exit_btn, size, shift=cfg.shift_exit)
+        clock.sleep(cfg.confirm_settle)
+        _click(io, cfg, cfg.confirm_btn, size)
+        try:
+            kind, mean = _wait_until(io, control, cfg, clock,
+                                     _budget(cfg.login_timeout),
+                                     (KIND_LOGIN,), "login")
+            emit("小退: 到登录界面 mean=%.1f（第 %d 次）" % (mean, attempt + 1))
+            break
+        except ReloginError as exc:
+            if attempt >= cfg.exit_retries:
+                raise
+            emit("小退: %s，重开菜单再试一次" % exc.stage)
+    elapsed = clock.now() - started
+    emit("小退: 完成，停在登录界面，用时 %.1fs" % elapsed)
+    return {"ok": True, "elapsed": round(elapsed, 3),
+            "mean": round(mean, 1), "stage": "login"}
