@@ -51,6 +51,7 @@ VK_F7 = 0x76
 VK_F8 = 0x77
 VK_F9 = 0x78
 VK_F10 = 0x79
+VK_F11 = 0x7A
 
 # Modifiers shared by every binding.  MOD_NOREPEAT stops the OS auto-repeat
 # while a key is held; the panel additionally waits for the resume combo to be
@@ -69,6 +70,8 @@ class HotkeyBinding:
 
 
 HOTKEY_BINDINGS: Tuple[HotkeyBinding, ...] = (
+    # F5 = 回到游戏：前台丢失后显式请求聚焦，走按钮门，不直接动作。
+    # 单键 F5 仍是游戏抬竿键；这里只注册三修饰键组合，不影响游戏。
     HotkeyBinding("refocus", "F5", "Ctrl+Alt+Shift+F5", 0xA705, VK_F5),
     # 启动后台放在最前：面板独占 F6，组合键不会影响游戏里的单独 F6(抬竿)。
     HotkeyBinding(
@@ -80,6 +83,9 @@ HOTKEY_BINDINGS: Tuple[HotkeyBinding, ...] = (
         "stop_after_fish", "F9", "Ctrl+Alt+Shift+F9", 0xA703, VK_F9
     ),
     HotkeyBinding("stop", "F10", "Ctrl+Alt+Shift+F10", 0xA704, VK_F10),
+    # 录制开关（开始/结束）：录制时人要走位，不方便回头点面板。
+    # 用 F11 而非 F12：F12 已被录制进程自身用作停止检键。
+    HotkeyBinding("nav_record", "F11", "Ctrl+Alt+Shift+F11", 0xA706, VK_F11),
 )
 
 HOTKEY_KEYS: Dict[str, str] = {binding.name: binding.key for binding in HOTKEY_BINDINGS}
@@ -135,11 +141,19 @@ def registration_supported(demo: bool = False) -> bool:
     return not demo and os.name == "nt"
 
 
+HOTKEY_PREFIX = "Ctrl+Alt+Shift"
+
 # 面板顶部统一声明一次前缀；按钮里只标 F 键，避免每个按钮重复 17 个字符。
 # 「勿单按」是防误操作提示：游戏里单按 F7 是抄网键。
 # 两行都控制在标签 wraplength=300 内，不会折成三行。
-HOTKEY_LEGEND = "热键前缀 Ctrl+Alt+Shift（勿单按 F 键）"
-HOTKEY_KEYS_LINE = "F6启动/F7恢复/F8观察/F9收尾/F10停止"
+HOTKEY_LEGEND = "热键前缀 %s（勿单按 F 键）" % HOTKEY_PREFIX
+HOTKEY_KEYS_LINE = "F6启动/F7恢复/F8观察/F9收尾/F10停止/F11录制"
+
+
+def combo_label(name: str) -> str:
+    """组合键全称：``Ctrl+Alt+Shift+F6``。"""
+    key = HOTKEY_KEYS.get(str(name))
+    return "%s+%s" % (HOTKEY_PREFIX, key) if key else ""
 
 
 def with_hotkey_label(name: str, text: str) -> str:
@@ -177,18 +191,15 @@ def format_report(report: Any) -> str:
     for item in items:
         if not isinstance(item, Mapping):
             continue
+        # listener 上报 name（resume/observe/...）；历史/测试数据只有 key
         name = str(item.get("name") or item.get("key") or "?")
         key = HOTKEY_KEYS.get(name) or str(item.get("key") or name)
         if item.get("ok"):
-            parts.append("%s成功" % key)
-            continue
-        error = item.get("error")
-        if error == ERROR_HOTKEY_ALREADY_REGISTERED:
+            parts.append("%s✓" % key)
+        elif item.get("error") == ERROR_HOTKEY_ALREADY_REGISTERED:
             parts.append("%s冲突" % key)
-        elif error:
-            parts.append("%s失败(%s)" % (key, error))
         else:
-            parts.append("%s失败" % key)
+            parts.append("%s✗" % key)
     return HOTKEY_LEGEND + " " + " ".join(parts) if parts else "热键：未注册"
 
 

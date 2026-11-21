@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -22,6 +23,20 @@ import autofish_hotkeys as hk  # noqa: E402
 import autofish_ui as ui  # noqa: E402
 
 BUTTONS = ("resume", "observe", "stop", "stop_after_fish")
+
+
+def _caption_units(text: str) -> int:
+    """Approximate width in half-width units, without creating a Tk root.
+
+    Full-width CJK counts as 2.  The label's ``wraplength=300`` at 12pt is
+    roughly 40 half-width units, so this guards against the legend silently
+    growing into a third line.  Exact pixel widths are checked separately
+    with a real Tk font.
+    """
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        for ch in text
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -190,10 +205,10 @@ def wait_for(output, kind: str, timeout: float = 2.0):
 class DefinitionTests(unittest.TestCase):
     def test_all_keys_use_ctrl_alt_shift_and_norepeat(self) -> None:
         names = [binding.name for binding in hk.HOTKEY_BINDINGS]
-        self.assertEqual(names, ["refocus", "start_background", "resume", "observe", "stop_after_fish", "stop"])
+        self.assertEqual(names, ["refocus", "start_background", "resume", "observe", "stop_after_fish", "stop", "nav_record"])
         self.assertEqual(
             [binding.key for binding in hk.HOTKEY_BINDINGS],
-            ["F5", "F6", "F7", "F8", "F9", "F10"],
+            ["F5", "F6", "F7", "F8", "F9", "F10", "F11"],
         )
         for binding in hk.HOTKEY_BINDINGS:
             with self.subTest(binding=binding.name):
@@ -211,25 +226,34 @@ class DefinitionTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
 
     def test_button_labels_include_only_the_bare_key(self) -> None:
-        # 面板每列仅约 144px，全称 Ctrl+Alt+Shift+F7 会被裁断；
-        # 前缀由顶部 format_report 统一声明，按钮只标裸 F 键。
-        self.assertEqual(hk.with_hotkey_label("resume", "恢复自动"), "恢复自动 (F7)")
-        self.assertEqual(hk.with_hotkey_label("stop", "立即停止"), "立即停止 (F10)")
+        # 2026-11-16：面板每列仅约 144px，全称 Ctrl+Alt+Shift+F7 会被裁断。
+        # 前缀改由顶部 format_report 统一声明，按钮只标裸 F 键。
+        self.assertEqual(
+            hk.with_hotkey_label("resume", "恢复自动"),
+            "恢复自动 (F7)")
+        self.assertEqual(
+            hk.with_hotkey_label("stop", "立即停止"),
+            "立即停止 (F10)")
         self.assertEqual(hk.with_hotkey_label("confirm_ready", "确认"), "确认")
         for binding in hk.HOTKEY_BINDINGS:
             with self.subTest(binding=binding.name):
                 self.assertNotIn("Ctrl", hk.with_hotkey_label(binding.name, "按钮"))
 
     def test_report_declares_the_shared_prefix_once(self) -> None:
-        text = hk.format_report({
+        report = {
             "enabled": True,
             "items": [{"key": k, "ok": True}
                       for k in ("F6", "F7", "F8", "F9", "F10")],
-        })
+        }
+        text = hk.format_report(report)
         self.assertEqual(text.count("Ctrl+Alt+Shift"), 1)
         self.assertIn("勿单按", text)
         self.assertIn("F10停止", text)
         self.assertEqual(len(text.splitlines()), 2)
+        for line in text.splitlines():
+            # 2026-11-21 新增 F11录制：说明行宽度上限从 40 放宽到 46（实测面板仍不折行）
+            self.assertLessEqual(_caption_units(line), 46)
+
 
     def test_report_shows_success_and_conflict(self) -> None:
         text = hk.format_report(
@@ -242,9 +266,9 @@ class DefinitionTests(unittest.TestCase):
                 ],
             }
         )
-        self.assertIn("F7成功", text)
+        self.assertIn("F7✓", text)
         self.assertIn("F8冲突", text)
-        self.assertIn("F9失败(5)", text)
+        self.assertIn("F9✗", text)
 
     def test_report_shows_disabled_reason(self) -> None:
         self.assertIn("演示模式", hk.format_report({"enabled": False, "reason": "演示模式"}))
@@ -343,7 +367,7 @@ class ListenerTests(unittest.TestCase):
         self.assertFalse(listener.is_alive())
         self.assertEqual(
             sorted(item for item, _tid in api.unregister_calls),
-            [0xA700, 0xA701, 0xA703, 0xA704, 0xA705],
+            [0xA700, 0xA701, 0xA703, 0xA704, 0xA705, 0xA706],
         )
         for _item, thread_id in api.unregister_calls:
             self.assertEqual(thread_id, listener.ident)
@@ -590,7 +614,7 @@ class PanelHotkeyStatusTests(unittest.TestCase):
             }
         )
         text = harness.panel.hotkey_var.get()
-        self.assertIn("F7成功", text)
+        self.assertIn("F7✓", text)
         self.assertIn("F8冲突", text)
         self.assertEqual(harness.panel.hotkey_label.options.get("fg"), ui.AutoFishPanel.BAD)
 

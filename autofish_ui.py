@@ -33,10 +33,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import app_paths
-import autofish_ownership as own
-from autofish_winddown_client import WinddownClient
-import autofish_session_timer as session_timer
 import autofish_hotkeys as hotkeys
+import autofish_ownership as own
+import autofish_session_timer as session_timer
+from autofish_winddown_client import WinddownClient
 from autofish_ipc import RuntimeClient
 
 PANEL_WIDTH = 320
@@ -669,34 +669,6 @@ def net_pending(snapshot: Any) -> Optional[bool]:
     return _optional_bool(value)
 
 
-def mode_allows_confirm(mode: Any) -> bool:
-    """AUTO may confirm; OBSERVE/MANUAL/BLOCKED must never enable the button.
-
-    A missing mode is tolerated so snapshots from older runtimes keep working;
-    it is never treated as a substitute for the state check.
-    """
-    value = _upper_text(mode)
-    if not value:
-        return True
-    return value in CONFIRM_MODES
-
-
-def net_pending(snapshot: Any) -> Optional[bool]:
-    """Return the explicit NET-confirmation pending flag, if present."""
-    if not isinstance(snapshot, Mapping):
-        return None
-    value = _first(
-        snapshot,
-        "net_pending",
-        "net_pending_confirmation",
-        "pending_net",
-        "awaiting_net_confirmation",
-        "net.pending",
-        "net.confirm_pending",
-    )
-    return _optional_bool(value)
-
-
 @dataclass(frozen=True)
 class ViewModel:
     connected: bool
@@ -787,7 +759,9 @@ def build_view(
     message = stat.get("message")
     message_text = "" if message is None else str(message).strip()
 
-    foreground_value = _optional_bool(_first(snap, "foreground", "foreground.active", "is_foreground"))
+    foreground_value = _optional_bool(
+        _first(snap, "foreground", "foreground.active", "is_foreground")
+    )
     fight_mode_value = _first(snap, "fight_mode", "fight.state", "fight_state")
     reason_value = _first(snap, "state.reason", "reason", "state_reason", "last_reason")
 
@@ -801,12 +775,23 @@ def build_view(
         mode_raw=mode_raw,
         reason=reason,
         foreground=foreground_value,
-        focus_text=focus_text(foreground_value, fight_mode=fight_mode_value, reason=reason_value, state=state_raw),
-        ownership_text=own.ownership_text(own.ownership_state(
+        focus_text=focus_text(
             foreground_value,
-            returning=(_optional_bool(snap.get("recovery_pending")) or _optional_bool(stat.get("recovery_pending")) or False),
-            stopped=stopped,
-        )),
+            fight_mode=fight_mode_value,
+            reason=reason_value,
+            state=state_raw,
+        ),
+        ownership_text=own.ownership_text(
+            own.ownership_state(
+                foreground_value,
+                returning=(
+                    _optional_bool(snap.get("recovery_pending"))
+                    or _optional_bool(stat.get("recovery_pending"))
+                    or False
+                ),
+                stopped=stopped,
+            )
+        ),
         session_limit_text=_session_limit_text(
             snap.get("session_status") or snap.get("session_limit")
         ),
@@ -955,7 +940,6 @@ def can_refocus(connected: bool, stopped: bool, foreground: Any) -> bool:
     if not bool(connected) or bool(stopped):
         return False
     return _optional_bool(foreground) is False
-    return True
 
 
 def can_emergency_stop() -> bool:
@@ -964,8 +948,8 @@ def can_emergency_stop() -> bool:
 
 @dataclass(frozen=True)
 class ButtonStates:
-    refocus: bool
     start_background: bool
+    refocus: bool
     resume: bool
     observe: bool
     stop: bool
@@ -1612,12 +1596,15 @@ class AutoFishPanel:
         self.tk = tk
         self.root = root
         self.demo = bool(demo)
+        self._clock = clock or time.time
+        # 控制权交接告知：默认标准 message box（模态、不可忽略、夺焦点直到确认）。
+        # 后台 bot 是独立进程，对话框暂停面板轮询不影响它。
+        # RF4_OWNERSHIP_NOTICE_NONMODAL=1 可切回非模态置顶提示窗。
         self._notice_since: Optional[float] = None
         self._notice_state: bool = False
         self._notice_nonmodal = bool(os.environ.get("RF4_OWNERSHIP_NOTICE_NONMODAL"))
         self._notice_beep = not bool(os.environ.get("RF4_OWNERSHIP_NOTICE_MUTE"))
         self._winddown = self._build_winddown_client()
-        self._clock = time.time
         self._client = None
         if not self.demo:
             self._client = client or RuntimeClient(endpoint_path, timeout=0.9)
@@ -1652,23 +1639,66 @@ class AutoFishPanel:
         self._apply_own_window_style()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_output)
-        self.root.after(1500, self._poll_winddown)
         self.root.after(250, self._layout_tick)
         self.root.after(800, self._sniff_probe)
+        self.root.after(1500, self._poll_winddown)
         self._apply_follow()
         self._apply_view(
             build_view({}, {"ok": False, "message": "等待后台状态…"})
         )
+
+    def _scroll_wheel(self, event: Any) -> str:
+        # Modal child dialogs must not scroll the underlying panel.
+        if event.widget.winfo_toplevel() != self.root:
+            return None
+        if self._scroll_canvas.bbox("all"):
+            delta = int(getattr(event, "delta", 0))
+            if delta and self._scroll_canvas.bbox("all")[3] > self._scroll_canvas.winfo_height():
+                self._scroll_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+        return "break"
+
+    def _scroll_page(self, direction: int) -> str:
+        self._scroll_canvas.yview_scroll(direction, "pages")
+        return "break"
 
     # -- construction ---------------------------------------------------
     def _build(self) -> None:
         tk = self.tk
         root = self.root
         root.title("国钓斧头助手")
+        try:
+            self._window_icon = tk.PhotoImage(
+                file=str(app_paths.resource_path("assets", "rf4autofish.png")))
+            root.iconphoto(True, self._window_icon)
+        except (tk.TclError, OSError):
+            self._window_icon = None
         root.configure(bg=self.BG)
         root.geometry(_geometry_string(PANEL_WIDTH, PANEL_HEIGHT, 120, 120))
-        root.minsize(PANEL_WIDTH, 620)
+        root.minsize(PANEL_WIDTH, 240)
         root.resizable(False, True)
+
+        # All growing content lives in a vertically scrollable viewport.
+        # Bind wheel events to this toplevel only, never to system-wide hooks.
+        viewport = tk.Frame(root, bg=self.BG)
+        viewport.pack(fill="both", expand=True)
+        scrollbar = tk.Scrollbar(viewport, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+        self._scroll_canvas = tk.Canvas(
+            viewport, bg=self.BG, highlightthickness=0,
+            yscrollcommand=scrollbar.set, yscrollincrement=24)
+        self._scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self._scroll_canvas.yview)
+        content = tk.Frame(self._scroll_canvas, bg=self.BG)
+        content_id = self._scroll_canvas.create_window(
+            (0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda event: self._scroll_canvas.configure(
+            scrollregion=self._scroll_canvas.bbox("all")))
+        self._scroll_canvas.bind("<Configure>", lambda event:
+            self._scroll_canvas.itemconfigure(content_id, width=event.width))
+        self.root.bind("<MouseWheel>", self._scroll_wheel, add="+")
+        self.root.bind("<Prior>", lambda event: self._scroll_page(-1), add="+")
+        self.root.bind("<Next>", lambda event: self._scroll_page(1), add="+")
+        root = content
 
         header = tk.Frame(root, bg=self.BG, padx=10, pady=3)
         header.pack(fill="x")
@@ -1825,6 +1855,81 @@ class AutoFishPanel:
             )
             self._buttons[name] = button
 
+        # ---- 前台恢复确认条（默认隐藏）：搏鱼类失焦回来时边沿显示 ----
+        self._recover_frame = tk.Frame(root, bg=self.WARN_BG if hasattr(self, "WARN_BG") else self.CARD,
+                                       padx=6, pady=3)
+        self._recover_var = tk.StringVar(value="")
+        tk.Label(
+            self._recover_frame, textvariable=self._recover_var,
+            bg=self._recover_frame.cget("bg"), fg=self.WARN if hasattr(self, "WARN") else self.FG,
+            font=("Microsoft YaHei UI", 12), anchor="w", justify="left",
+            wraplength=300,
+        ).pack(fill="x")
+        recover_btns = tk.Frame(self._recover_frame, bg=self._recover_frame.cget("bg"))
+        recover_btns.pack(fill="x")
+        for column in (0, 1):
+            recover_btns.grid_columnconfigure(column, weight=1)
+        tk.Button(
+            recover_btns, text="继续本条", command=self._on_recover_continue,
+            font=("Microsoft YaHei UI", 12), bg=self.CARD, fg=self.FG,
+            relief="groove", bd=1, padx=2, pady=2, highlightthickness=0,
+        ).grid(row=0, column=0, sticky="we", padx=2, pady=1)
+        tk.Button(
+            recover_btns, text="放弃本条", command=self._on_recover_abandon,
+            font=("Microsoft YaHei UI", 12), bg=self.CARD, fg=self.FG,
+            relief="groove", bd=1, padx=2, pady=2, highlightthickness=0,
+        ).grid(row=0, column=1, sticky="we", padx=2, pady=1)
+        self._recover_visible = False
+        self._last_foreground: Optional[bool] = None
+        if self._notice_nonmodal:
+            self._build_ownership_notice()
+
+        # ---- 走位区（2026-11-15）：小退回 home / 录制开关 / 走到标签 ----
+        nav_frame = tk.Frame(root, bg=self.BG, padx=6, pady=2)
+        self._nav_anchor = nav_frame
+        nav_frame.pack(fill="x")
+        for column in range(2):
+            nav_frame.grid_columnconfigure(column, weight=1)
+        nav_specs = (
+            ("nav_home", "小退回 home", self._on_nav_home),
+            ("nav_record", "● 开始录制", self._on_nav_record_toggle),
+            ("nav_goto", "走到标签…", self._on_nav_goto),
+            ("nav_routes", "路线管理…", self._on_nav_routes),
+            ("nav_limit", "时限设置…", self._on_nav_limit),
+        )
+        for index, (name, text, command) in enumerate(nav_specs):
+            btn = tk.Button(
+                nav_frame,
+                text=text,
+                command=command,
+                font=("Microsoft YaHei UI", 12),
+                bg=self.CARD,
+                fg=self.FG,
+                activebackground="#e8eef7",
+                activeforeground=self.FG,
+                relief="groove",
+                bd=1,
+                padx=2,
+                pady=2,
+                highlightthickness=0,
+            )
+            btn.grid(row=index // 2, column=index % 2,
+                     sticky="we", padx=2, pady=1)
+            self._buttons[name] = btn
+        self.nav_var = tk.StringVar(value="走位：空闲")
+        tk.Label(
+            root,
+            textvariable=self.nav_var,
+            bg=self.BG,
+            fg=self.MUTED,
+            font=("Microsoft YaHei UI", 12),
+            anchor="w",
+            justify="left",
+            wraplength=300,
+            padx=10,
+            pady=0,
+        ).pack(fill="x")
+
         # 协议层状态行（不是钓鱼状态机的一部分；由本进程直接探测）
         self.sniff_var = tk.StringVar(value="协议层：检测中…")
         tk.Label(
@@ -1958,11 +2063,16 @@ class AutoFishPanel:
         self._update_ownership_notice(view)
 
     def _update_ownership_notice(self, view: ViewModel) -> None:
-        """控制权 工具→用户 边沿弹告知；离线/停止/demo 不弹。"""
+        """控制权从工具交回用户时弹强显著告知。
+
+        只在「曾工具控制 → 现在用户控制」的边沿触发一次；离线/停止/demo 不弹，
+        避免刚启动就弹、或后台本来没在控制时误报。
+        """
         owner = getattr(view, "ownership_text", "")
         is_user = owner == own.ownership_text(own.USER)
         prev = getattr(self, "_prev_ownership", None)
         self._prev_ownership = owner
+
         if not view.connected or view.stopped or self.demo:
             if not is_user:
                 self._dismiss_ownership_notice()
@@ -2008,6 +2118,7 @@ class AutoFishPanel:
         self._hide_recovery_bar()
         self._send_command("stop_after_fish")
 
+    # ------------------------------------------------------------------
     # 控制权交接告知：默认标准 message box（模态、不可忽略、夺焦点直到确认）。
     # 后台 bot 是独立进程，对话框暂停面板轮询不影响它。
     # 见 CONTROL-OWNERSHIP-PLAN.md §4（2026-11-18 二次修正）。
@@ -2130,6 +2241,7 @@ class AutoFishPanel:
         self._notice_state = False
         self._notice_since = None
 
+    # ------------------------------------------------------------------
     # 会话到时限的自动收尾（触发文件由 bot 写；面板拉起独立执行器 + 弹结果）
     # ------------------------------------------------------------------
     def _build_winddown_client(self) -> WinddownClient:
@@ -2451,6 +2563,7 @@ class AutoFishPanel:
                 return
             self._start_background()
         if name == "refocus":
+            # 走按钮门；面板只发 IPC，聚焦由后台执行。
             self._dispatch_hotkey("refocus")
         elif name == "resume":
             self._begin_resume_release_wait()
@@ -2463,6 +2576,9 @@ class AutoFishPanel:
             self._dispatch_hotkey("observe")
         elif name == "stop_after_fish":
             self._dispatch_hotkey("stop_after_fish")
+        elif name == "nav_record":
+            # 录制开关：与「● 开始录制 / ■ 结束录制」按钮完全同一入口。
+            self._on_nav_record_toggle()
 
     def _background_online(self) -> bool:
         """后台是否已在运行（能被 IPC 连上）。"""
@@ -2593,6 +2709,249 @@ class AutoFishPanel:
                 install.config(state=("normal" if not npcap else "disabled"))
         self.root.after(5000, self._sniff_probe)
 
+    # -- 走位区 ---------------------------------------------------------
+
+    def _nav_say(self, text: str) -> None:
+        """走位状态行（线程安全：非 UI 线程用 after）。"""
+        try:
+            self.nav_var.set(text)
+        except Exception:
+            pass
+
+    def _nav_worker(self, fn) -> None:
+        import threading  # noqa: PLC0415
+
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _on_nav_home(self) -> None:
+        """小退重登回 home。独立线程跑，避免阻塞 UI。"""
+        self._nav_say("小退回 home 中…（约 40-90 秒）")
+
+        def work() -> None:
+            import autofish_goto as ag  # noqa: PLC0415
+
+            ok = ag._relogin(lambda m: None)
+            self._nav_say("已回 home ✓" if ok else "小退失败，看日志")
+
+        self._nav_worker(work)
+
+    def _on_nav_record_toggle(self) -> None:
+        """录制开关：一下开始（拉起录制进程），两下结束（发停止热键）。"""
+        if getattr(self, "_rec_proc", None) and self._rec_proc.poll() is None:
+            # 第二下：注入停止热键 Ctrl+Alt+Shift+F12
+            self._nav_say("结束录制…（保存中）")
+
+            def stop_it() -> None:
+                try:
+                    import ctypes  # noqa: PLC0415
+                    from pynput.keyboard import Controller, Key  # noqa: PLC0415
+
+                    kc = Controller()
+                    keys = [Key.ctrl_l, Key.alt_l, Key.shift_l, Key.f12]
+                    for k in keys:
+                        kc.press(k)
+                    import time as _t  # noqa: PLC0415
+
+                    _t.sleep(0.6)
+                    for k in reversed(keys):
+                        kc.release(k)
+                    _t.sleep(1.5)
+                except Exception:
+                    pass
+                self._rec_proc.wait(timeout=10)
+                # 录制进程退出 → 弹标签框
+                self.root.after(0, self._ask_route_tag)
+
+            self._nav_worker(stop_it)
+            return
+
+        # 第一下：拉起录制进程（独立进程，防 UI 卡死）
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        py = sys.executable
+        script = str(
+            __import__("pathlib").Path(__file__).resolve().parent
+            / "autofish_replay.py")
+        log_path = __import__("app_paths").data_path("record.log")
+        logf = open(log_path, "a", encoding="utf-8", errors="replace")
+        self._rec_proc = subprocess.Popen(
+            [py, script, "record", "--name", "_pending_route"],
+            stdout=logf, stderr=subprocess.STDOUT,
+            cwd=str(__import__("pathlib").Path(__file__).resolve().parent))
+        self._buttons["nav_record"].config(text="■ 结束录制")
+        self._nav_say("录制中… 走你的路，到点后按『■ 结束录制』")
+
+    def _ask_route_tag(self) -> None:
+        """录制完成 → 阻断式标签框（快捷标签 + 自由输入）。"""
+        import autofish_routes as routes  # noqa: PLC0415
+
+        self._buttons["nav_record"].config(text="● 开始录制")
+        win = tk.Toplevel(self.root)
+        win.title("为这条路线打标签")
+        win.grab_set()          # 阻断式：不处理完不给点主窗
+        win.attributes("-topmost", True)
+        tk.Label(
+            win, text="这条路线通向哪里？（点快捷标签或自己输入）",
+            font=("Microsoft YaHei UI", 13)).pack(padx=14, pady=8)
+
+        var = tk.StringVar(value="")
+        entry = tk.Entry(win, textvariable=var, font=("Microsoft YaHei UI", 14),
+                         width=22)
+        entry.pack(padx=14, pady=2)
+        entry.focus_set()
+
+        grid = tk.Frame(win)
+        grid.pack(padx=8, pady=4)
+        for i, tag in enumerate(routes.QUICK_TAGS):
+            tk.Button(
+                grid, text=tag, font=("Microsoft YaHei UI", 12),
+                command=lambda t=tag: var.set(t),
+                relief="groove", bd=1, padx=4, pady=2,
+            ).grid(row=i // 5, column=i % 5, padx=2, pady=2)
+
+        state = {"saved": False}
+
+        def save() -> None:
+            tag = (var.get() or "").strip()
+            if not tag:
+                return
+            try:
+                import autofish_routes as R  # noqa: PLC0415
+                import app_paths  # noqa: PLC0415
+                import shutil  # noqa: PLC0415
+
+                src = app_paths.data_path("replays", "_pending_route.json")
+                fname = "%s__%s.json" % (
+                    R.safe_name(R.DEFAULT_MAP), R.safe_name(tag))
+                dst = app_paths.data_path("replays", fname)
+                if src.is_file():
+                    shutil.move(str(src), str(dst))
+                    R.register_route(R.DEFAULT_MAP, tag, fname)
+                    state["saved"] = True
+                    self._nav_say("已存路线：%s" % tag)
+            except Exception as exc:  # noqa: BLE001
+                self._nav_say("保存失败：%s" % exc)
+            win.destroy()
+
+        tk.Button(win, text="保存", font=("Microsoft YaHei UI", 13),
+                  command=save, width=10).pack(side="left",
+                                               padx=12, pady=8)
+        tk.Button(win, text="丢弃", font=("Microsoft YaHei UI", 13),
+                  command=win.destroy, width=10).pack(side="right",
+                                                      padx=12, pady=8)
+        win.bind("<Return>", lambda e: save())
+
+    def _on_nav_goto(self) -> None:
+        """走到标签：小退回 home → 重放该标签路线。"""
+        import autofish_routes as routes  # noqa: PLC0415
+
+        tags = routes.list_tags(routes.DEFAULT_MAP)
+        if not tags:
+            self._nav_say("还没有路线——先『● 开始录制』走一遍")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("走到哪里？")
+        win.grab_set()
+        win.attributes("-topmost", True)
+        tk.Label(win, text="选目的地（会先小退回 home 再走）",
+                 font=("Microsoft YaHei UI", 13)).pack(padx=14, pady=8)
+        state = {"tag": None}
+
+        def pick(tag: str) -> None:
+            state["tag"] = tag
+            win.destroy()
+
+        for tag in tags:
+            tk.Button(
+                win, text=tag, font=("Microsoft YaHei UI", 13),
+                command=lambda t=tag: pick(t), relief="groove",
+                bd=1, padx=6, pady=3,
+            ).pack(fill="x", padx=14, pady=2)
+
+        def after_close() -> None:
+            tag = state["tag"]
+            if not tag:
+                return
+            self._nav_say("前往 %s：小退回 home 中…" % tag)
+
+            def work() -> None:
+                import autofish_goto as ag  # noqa: PLC0415
+
+                ok = ag.goto(tag)
+                self._nav_say(
+                    ("到达 %s ✓" % tag) if ok else "前往 %s 失败" % tag)
+
+            self._nav_worker(work)
+
+        win.protocol("WM_DELETE_WINDOW", lambda: (win.destroy(), after_close()))
+
+    def _on_nav_limit(self) -> None:
+        """时限设置：读取当前 limit，输入小时数（或分钟），写回 session.json。"""
+        tk = self.tk
+        import autofish_session_store as ss  # noqa: PLC0415
+
+        timer, note = ss.load_session()
+        win = tk.Toplevel(self.root)
+        win.title("本次钓鱼时限")
+        win.resizable(False, False)
+        win.transient(self.root)
+        tk.Label(win, text="到时后：钓完最后一条 → 卖鱼 → 小退（停登录界面）",
+                 font=("Microsoft YaHei UI", 11), fg=self.MUTED).pack(
+            padx=14, pady=(12, 4))
+        tk.Label(win, text="时限（小时，可填小数如 0.5；范围 1 分钟~24 小时）：",
+                 font=("Microsoft YaHei UI", 12)).pack(padx=14, pady=4)
+        var = tk.StringVar(value="%g" % (timer.limit / 3600.0))
+        entry = tk.Entry(win, textvariable=var, font=("Microsoft YaHei UI", 14),
+                         width=12)
+        entry.pack(padx=14, pady=2)
+        entry.focus_set()
+
+        def save() -> None:
+            try:
+                hours = float(var.get().strip())
+                timer.set_limit(hours * 3600)
+                if ss.save_session(timer):
+                    self._nav_say("时限已设为 %s 小时" % ("%g" % hours))
+                    win.destroy()
+                else:
+                    self._nav_say("时限保存失败（磁盘写入）")
+            except ValueError:
+                self._nav_say("输入无效：请输入数字小时数")
+            except Exception as exc:  # noqa: BLE001
+                self._nav_say("时限设置失败：%s" % type(exc).__name__)
+
+        btns = tk.Frame(win)
+        btns.pack(padx=14, pady=10)
+        tk.Button(btns, text="保存", command=save,
+                  font=("Microsoft YaHei UI", 12), relief="groove", bd=1,
+                  padx=10).pack(side="left", padx=(0, 8))
+        tk.Button(btns, text="取消", command=win.destroy,
+                  font=("Microsoft YaHei UI", 12), relief="groove", bd=1,
+                  padx=10).pack(side="left")
+
+    def _on_nav_routes(self) -> None:
+        """路线管理：列出已有标签（后续可加删除/重命名）。"""
+        import autofish_routes as routes  # noqa: PLC0415
+
+        tags = routes.list_tags(routes.DEFAULT_MAP)
+        if not tags:
+            self._nav_say("路线库为空")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("路线库")
+        win.grab_set()
+        win.attributes("-topmost", True)
+        tk.Label(win, text="已录路线（%d 条）" % len(tags),
+                 font=("Microsoft YaHei UI", 13)).pack(padx=14, pady=8)
+        for tag in tags:
+            hit = routes.find_route(routes.DEFAULT_MAP, tag)
+            tk.Label(
+                win,
+                text="• %s  （%s）" % (tag, hit.get("created", "?")),
+                font=("Microsoft YaHei UI", 12), anchor="w",
+            ).pack(fill="x", padx=16)
+
     def _on_sniff_toggle(self) -> None:
         """启动/停止协议层抓包（子线程执行，避免提权弹窗卡住 UI）。"""
         import threading  # noqa: PLC0415
@@ -2689,12 +3048,20 @@ class AutoFishPanel:
             self.note_var.set("布局异常")
 
     def _place(self, areas: Sequence[RectTuple], rect: Any) -> None:
+        height = PANEL_HEIGHT
+        if rect and len(rect) == 4:
+            # rect uses screen edges (left, top, right, bottom).
+            # Tk geometry excludes native borders/title bar, so subtract those
+            # to match the game's outer window height rather than overshooting.
+            self.root.update_idletasks()
+            decoration = max(0, self.root.winfo_rooty() - self.root.winfo_y())
+            border = max(0, self.root.winfo_rootx() - self.root.winfo_x())
+            height = max(240, int(rect[3] - rect[1]) - decoration - border)
+        self._panel_height = height
         x, y = place_panel(
-            rect, areas, PANEL_WIDTH, PANEL_HEIGHT, PANEL_MARGIN
+            rect, areas, PANEL_WIDTH, height, PANEL_MARGIN
         )
-        self.root.geometry(
-            _geometry_string(PANEL_WIDTH, PANEL_HEIGHT, x, y)
-        )
+        self.root.geometry(_geometry_string(PANEL_WIDTH, height, x, y))
 
     def _drag_press(self, event: Any) -> None:
         self._drag_origin = (
@@ -2721,7 +3088,7 @@ class AutoFishPanel:
         x = window_x + delta_x
         y = window_y + delta_y
         self.root.geometry(
-            _geometry_string(PANEL_WIDTH, PANEL_HEIGHT, x, y)
+            _geometry_string(PANEL_WIDTH, self.root.winfo_height(), x, y)
         )
 
     def _drag_release(self, _event: Any) -> None:
@@ -2805,6 +3172,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # 2026-11-15 单例接管：同一时刻只允许一个面板。旧面板还活着时，
+    # 新实例把旧窗口带到前台后自行退出——避免两个面板叠加注册全局
+    # 热键（RegisterHotKey 全局生效，叠加=冲突+残留，实测用户系统
+    # 键鼠被抢 17 小时）。
+    # 更名过渡期：旧版 exe 的窗口标题还是 "RF4 自动钓鱼"，必须一并
+    # 匹配，否则新旧面板互不识别，反而会开出第二个面板抢热键。
+    try:
+        import ctypes  # noqa: PLC0415
+        _u = ctypes.windll.user32
+        _u.SetProcessDPIAware()
+        _prev = 0
+        for _title in ("国钓斧头助手", "RF4 自动钓鱼"):
+            _prev = int(_u.FindWindowW(None, _title) or 0)
+            if _prev:
+                break
+        if _prev:
+            if _u.IsIconic(_prev):
+                _u.ShowWindow(_prev, 9)  # SW_RESTORE
+            # 后台进程直接 SetForegroundWindow 会被系统拒绝；TOPMOST 抖两下
+            # 是老办法，能把窗口带到最上面让用户看见。
+            for _ in range(2):
+                _u.SetWindowPos(_prev, -1, 0, 0, 0, 0, 0x0003)   # TOPMOST
+                _u.SetWindowPos(_prev, -2, 0, 0, 0, 0, 0x0003)   # NOMOST
+            _u.SetForegroundWindow(_prev)
+            print("检测到已有面板 (hwnd=%d)，已置前；本实例退出。" % _prev)
+            return 0
+    except Exception:
+        pass
 
     root = tk.Tk()
     panel = AutoFishPanel(
